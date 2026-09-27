@@ -1,12 +1,18 @@
 {
   "$schema": "https://atomgit.com/k4m7v2pz/xtl-toolchain/raw/dev/cli/xtl.schema.json",
+  "依赖项": {
+    "渲染": {
+      "仓库地址": "https://gitcode.com/MARKJY/XuanTieRendering",
+      "分支": "main"
+    }
+  },
   "包": {
-    "项目名称": "xuantie-endless-corridor",
-    "项目版本号": "0.1.0",
     "代码文件入口": "主函数.xt",
-    "语言标准": "2026",
     "作者": [],
-    "时区": "Asia/Shanghai (UTC+08:00)"
+    "时区": "Asia/Shanghai (UTC+08:00)",
+    "语言标准": "2026",
+    "项目名称": "xuantie-endless-corridor",
+    "项目版本号": "0.1.0"
   },
   "构建配置": {
     "dev": {
@@ -18,10 +24,9 @@
       "调试开关": false
     }
   },
-  "依赖项": {},
   "脚本": {
-    "dev": "xtl i",
     "build": "xtl b",
+    "dev": "xtl i",
     "test": "xtl t"
   }
 }

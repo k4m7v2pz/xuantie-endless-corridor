@@ -4,6 +4,11 @@
     "核心": {
       "来源": "https://github.com/MARKJY-China/XuanTie-Lang.git",
       "提交编号": "87f77bda41afc6c38657f5008b123cce5c83d10d"
+    },
+    "渲染": {
+      "来源": "https://gitcode.com/MARKJY/XuanTieRendering",
+      "提交编号": "cc097058679c85bc846831451502bed87f693e4a",
+      "引用标识": "refs/heads/main"
     }
   },
   "二进制": {

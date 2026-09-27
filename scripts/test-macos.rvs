@@ -1,0 +1,85 @@
+#!/usr/bin/env rvs
+# ============================================================================
+# test-macos.rvs — macOS 短时运行验证脚本
+#
+# 用法（项目根目录）:
+#   rvs scripts/test-macos.rvs
+#
+# 流程：构建（scripts/build-macos.rvs 逻辑）→ 短时运行 4 秒 → 读取状态报告。
+# 状态文件 /tmp/xtl-test.state：ALIVE=窗口正常运行；CRASHED=启动崩溃。
+# 运行日志 /tmp/xtl-test-run.log。
+# ============================================================================
+
+write-output "=== xuantie-endless-corridor macOS 测试 ==="
+write-output ""
+
+# ---- 1. 渲染库依赖 -----------------------------------------------------------
+if (test-path --path tiepm_modules/渲染) {
+  write-output "[1] 渲染库已存在，跳过 add"
+} else {
+  write-output "[1] 添加渲染库依赖"
+  /Users/user2/.cargo/bin/xtl add 渲染 https://gitcode.com/MARKJY/XuanTieRendering --branch main
+}
+write-output ""
+
+# ---- 2. macOS 渲染桥补丁 ------------------------------------------------------
+write-output "[2] 应用 macOS 渲染桥补丁"
+copy-item --path patches/渲染桥.c.macos --destination tiepm_modules/渲染/渲染桥.c
+write-output ""
+
+# ---- 3. 布局桥接 --------------------------------------------------------------
+if (test-path --path .tiepm/已安装/渲染) {
+  write-output "[3] 布局桥接已存在"
+} else {
+  write-output "[3] 建立 .tiepm/已安装/渲染 符号链接"
+  /bin/mkdir -p .tiepm/已安装
+  /bin/ln -sfn ../../tiepm_modules/渲染 .tiepm/已安装/渲染
+}
+write-output ""
+
+# ---- 4. 运行时 C 源码 ---------------------------------------------------------
+if (test-path --path /Users/user2/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/xt_runtime.c) {
+  write-output "[4] 运行时 C 已就位"
+} else {
+  write-output "[4] 补齐运行时 C 源码"
+  /bin/mkdir -p /Users/user2/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime
+  /usr/bin/ditto /Users/user2/Documents/Code.localized/xtl-toolchain/XuanTie-Lang/runtime /Users/user2/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime
+}
+write-output ""
+
+# ---- 5. raylib 缓存 -----------------------------------------------------------
+if (test-path --path /Users/user2/Library/Caches/xtl/raylib/darwin-arm64/libraylib.a) {
+  write-output "[5] raylib 缓存已存在"
+} else {
+  write-output "[5] 缺 raylib 缓存，先运行 scripts/build-macos.rvs 完成初始化"
+}
+write-output ""
+
+# ---- 6. 生成 LLVM IR ---------------------------------------------------------
+write-output "[6] 生成 LLVM IR（xtc 链接失败属预期；轮询截获 .ll）"
+/bin/bash scripts/xtc-抓IR.sh /Users/user2/Library/Caches/xtl/core/darwin-arm64/xtc-package/xtc /Users/user2/Documents/Code.localized/xuantie-endless-corridor /tmp/corridor.ll 主函数.xt dist/corridor
+write-output ""
+
+# ---- 7. 编译游戏对象 ----------------------------------------------------------
+write-output "[7] 编译游戏对象"
+clang -target arm64-apple-darwin -c /tmp/corridor.ll -o /tmp/corridor.o -Og
+write-output ""
+
+# ---- 8. 编译渲染桥 ------------------------------------------------------------
+write-output "[8] 编译渲染桥对象"
+clang -target arm64-apple-darwin -c tiepm_modules/渲染/渲染桥.c -o /tmp/corridor_bridge.o -I tiepm_modules/渲染 -Og
+write-output ""
+
+# ---- 9. 链接 ----------------------------------------------------------------
+write-output "[9] 链接"
+clang /tmp/corridor.o /Users/user2/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/xt_runtime.c /Users/user2/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/xt_threadpool.c /Users/user2/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/xt_net.c /Users/user2/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/xt_tls.c /tmp/corridor_bridge.o /Users/user2/Library/Caches/xtl/raylib/darwin-arm64/libraylib.a -o corridor -framework Cocoa -framework OpenGL -framework IOKit -framework CoreVideo
+write-output ""
+
+# ---- 10. 短时运行验证（窗口约 4 秒，自动关闭） --------------------------------
+write-output "[10] 短时运行验证（4 秒）"
+if (test-path --path /tmp/xtl-test.state) {
+  remove-item --path /tmp/xtl-test.state
+}
+/bin/bash scripts/bash/run-check.sh
+read-file --path /tmp/xtl-test.state
+write-output ""

@@ -5,3 +5,5 @@ dist/
 *.dSYM/
 tiepm_modules/
 XuanTie-Lang/
+.tiepm/
+corridor
