@@ -1,10 +1,10 @@
 #!/usr/bin/env rvs
-# test.rvs — 无尽回廊短时运行验证（4 秒自动关闭，单窗口）
+# test.rvs — 启动无尽回廊（长期运行，关窗即结束）
 # 用法: rvs test.rvs   （若尚未构建，先 rvs scripts/build-macos.rvs）
-write-output "=== 无尽回廊 短时验证（4 秒） ==="
+# 短时回归验证请用: rvs scripts/test-macos.rvs（4 秒自动关闭，单窗口）
+write-output "=== 无尽回廊 启动（回车开始 · WASD移动 · ESC暂停） ==="
 if (test-path --path corridor) {
-  /bin/bash scripts/bash/run-check.sh
-  read-file --path /tmp/xtl-test.state
+  ./corridor
 } else {
   write-output "未找到 ./corridor，请先运行: rvs scripts/build-macos.rvs"
 }
