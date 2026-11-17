@@ -11,7 +11,59 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
+#include <math.h>   // llround(issue #69 数值分派)
+#include <time.h>  // nanosleep(issue #95 暂停 真休眠)
+#if !defined(_WIN32)
+#include <glob.h>   // POSIX:运行时 glob 探测系统字体路径(如 AssetsV2 动态 asset 目录)
+#endif
+
+#if defined(__APPLE__)
+// === macOS 非 ASCII 路径启动自愈(issue #83) ===
+// 产物路径含非 ASCII(中文名二进制 / 中文名 .app)时,GLFW/CFBundle 初始化对可执行
+// 路径做 bundle 查找,链上出现无效 CFString → SIGTRAP(裸二进制,exit 133)或 SIGSEGV(.app)。
+// 自愈:检测自身路径含非 ASCII 字节 → 复制到 ASCII 缓存路径(带源路径哈希唯一名,防并发
+// 覆盖) → 改写 argv[0] 后 execv 重执行;第二次运行为纯 ASCII 路径,自动跳过本逻辑,无循环。
+#include <stdio.h>
+#include <unistd.h>
+#include <mach-o/dyld.h>
+#include <crt_externs.h>
+#include <sys/stat.h>
+
+static void xt_83_selfheal(void) {
+    char self_path[4096];
+    uint32_t sz = (uint32_t)sizeof(self_path);
+    if (_NSGetExecutablePath(self_path, &sz) != 0) return;
+    int non_ascii = 0;
+    for (const char *p = self_path; *p; p++) {
+        if ((unsigned char)*p > 127) { non_ascii = 1; break; }
+    }
+    if (!non_ascii) return;  /* 纯 ASCII:常态路径,零开销 */
+    /* FNV-1a:目标名带源路径哈希,不同产物并发自愈互不覆盖 */
+    unsigned long long h = 1469598103934665603ULL;
+    for (const char *p = self_path; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+    mkdir("/tmp/xt-83-selfheal", 0755);
+    char dst[256];
+    snprintf(dst, sizeof(dst), "/tmp/xt-83-selfheal/healed_%016llx", h);
+    FILE *in = fopen(self_path, "rb");
+    if (!in) return;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return; }
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { fclose(in); fclose(out); return; }
+    }
+    fclose(in);
+    fclose(out);
+    chmod(dst, 0755);
+    char **argv = *_NSGetArgv();
+    argv[0] = dst;
+    execv(dst, argv);
+    _exit(127);  /* execv 失败:继续运行必撞 GLFW 崩溃,显式退出而非带病启动 */
+}
+#endif
 
 // === XuanTie 运行时类型（精简版，避免依赖完整 xt_runtime.h） ===
 // 标记值操作
@@ -52,6 +104,21 @@ typedef struct {
 #define IS_PTR(v)       (((uintptr_t)(v) & 0x1) == 0 && (v) > 4096)
 #define IS_INT(v)       (((uintptr_t)(v) & 0x1) == 1)
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 外函返回值编码约定(所有 外 函 实现必须遵守;issue #44)
+//
+// 玄铁侧只认三种返回值:
+//   ① 玄铁对象指针(xt_string_new 等,带 XTObject 头与 magic)——ARC 可 retain/release
+//   ② 标记整数 XT_FROM_INT(n) —— 标量,ARC 不碰
+//   ③ 真/假/空 小常量(XT_TRUE/XTFALSE/0)
+//
+// **不得返回裸 C 指针**:它 LSB=0 且 >4096,玄铁侧 ARC 会按 ① 去校验 magic,
+// 读到的若是 C 结构体(raylib 的 Sound/Music/Texture 等)即误报"堆损坏或非法指针访问"并退出。
+//
+// 资源句柄一律"槽位池 + XT_FROM_INT(槽号+1)",**0 表示失败**(调用方可可靠判断)。
+// 本文件四处实现:纹理(32 槽)、字体(8 槽)、音效(32 槽)、音乐流(32 槽)。
+// ═══════════════════════════════════════════════════════════════════════════
+
 // 提取字符串: 如果是对象指针则返回 data，否则返回空串
 static const char* xt_get_cstr(uintptr_t v) {
     if (IS_PTR(v) && v != 0) {
@@ -63,15 +130,27 @@ static const char* xt_get_cstr(uintptr_t v) {
 
 // runtime 字符串构造(剪贴板读取等需返回玄铁字符串对象的桥函数用)
 extern void* xt_string_new(const char*);
+// runtime ARC 释放:桥内自建的临时对象(如系统字体名解析出的路径串)用完要还回去,否则每次调用漏一个
+extern void xt_release(uintptr_t);
 
 // 提取浮点数: 如果是 XTFloat 对象则返回 value
+// 标记整数容错(2026-10-04 狗粮实测):旧实现只认 XTFloat,实参写 1(而非 1.0)时静默归 0.0;
+// 现对标记整数按数值返回——库的"小数"形参从此 1 与 1.0 两种写法通吃。
 static double xt_get_float(uintptr_t v) {
+    if (IS_INT(v)) return (double)XT_TO_INT(v);
     if (IS_PTR(v) && v != 0) {
         XTFloat* f = (XTFloat*)v;
         if (f->type_id == 2) return f->value;
     }
     return 0.0;
 }
+
+// issue #69 数值分派:整数 tag 与 XTFloat 对象通吃,替代绘制入口的裸 XT_TO_INT。
+// 旧行为:浮点对象指针被 >>1 解出天文数字(浮点半径→圆铺满 framebuffer→窗口纯白)。
+// xt_ni:整型形参(坐标/尺寸/颜色/字号)按最近取整;xt_nf:浮点形参(半径/旋转/矩形域)保精度。
+// 非数值实参一律归 0——永不产出垃圾几何。
+static inline int64_t xt_ni(uintptr_t v) { return (int64_t)llround(xt_get_float(v)); }
+static inline float   xt_nf(uintptr_t v) { return (float)xt_get_float(v); }
 
 // 创建浮点数 XTValue，ref_count=1 纳入正常 ARC 管理
 static uintptr_t xt_make_float(double v) {
@@ -114,7 +193,12 @@ extern __declspec(dllimport) intptr_t WINAPI GetWindowLongPtrW(HWND hWnd, int nI
 extern __declspec(dllimport) intptr_t WINAPI SetWindowLongPtrW(HWND hWnd, int nIndex, intptr_t dwNewLong);
 extern __declspec(dllimport) int WINAPI SetWindowPos(HWND hWnd, HWND hWndInsertAfter,
     int X, int Y, int cx, int cy, unsigned int uFlags);
+typedef struct { long left, top, right, bottom; } XT_CLIENT_RECT;
+extern __declspec(dllimport) int WINAPI GetClientRect(HWND hWnd, XT_CLIENT_RECT* lpRect);
+extern __declspec(dllimport) int WINAPI AdjustWindowRectEx(XT_CLIENT_RECT* lpRect, unsigned long dwStyle,
+    int bMenu, unsigned long dwExStyle);
 #define XT_GWL_STYLE        (-16)
+#define XT_GWL_EXSTYLE      (-20)
 #define XT_WS_THICKFRAME    0x00040000L
 #define XT_WS_MAXIMIZEBOX   0x00010000L
 #define XT_WS_CAPTION       0x00C00000L
@@ -122,7 +206,11 @@ extern __declspec(dllimport) int WINAPI SetWindowPos(HWND hWnd, HWND hWndInsertA
 #define XT_SWP_NOSIZE       0x0001
 #define XT_SWP_NOMOVE       0x0002
 #define XT_SWP_NOZORDER     0x0004
+#define XT_SWP_NOACTIVATE   0x0010
 #define XT_SWP_FRAMECHANGED 0x0020
+// Per-Monitor DPI Aware V2(PMv2,Win10 1703+)——动态取符号,旧系统静默跳过(issue #22)
+extern __declspec(dllimport) HANDLE WINAPI GetModuleHandleA(const char* lpModuleName);
+extern __declspec(dllimport) void* WINAPI GetProcAddress(HANDLE hModule, const char* lpProcName);
 // 自管可调整状态(无边框还原时按它决定是否恢复厚边框)
 static int g_xt_resizable = 0;
 static void xt_apply_style(HWND hwnd) {
@@ -160,19 +248,62 @@ static unsigned char* xt_read_file_bytes(const char* u8path, int* outSize) {
 // 窗口管理
 // ============================================================
 
+/* 非 Windows 平台"请求关闭窗口"标志:置位后由 XT_WindowShouldClose 返回,
+   主循环下一轮正常退出,调用方统一执行一次 CloseWindow——避免与 XT_CloseWindow
+   连用时二次 CloseWindow → rlUnloadRenderBatch 二次释放 → SIGABRT(issue #47) */
+static int xt_window_close_requested = 0;
+/* issue #56:关闭窗口() 幂等标记——raylib 的 CloseWindow 会卸载渲染批处理,
+   二次调用触发 rlUnloadRenderBatch 双重释放 → SIGABRT(macOS 实测)。置位后二次调用直接返回。 */
+static int xt_window_closed = 0;
+
+/* 延迟截图(issue #92):登记路径 + 是否处于 开始绘图/结束绘图 之间。
+   定义放这里是因为 关闭窗口 与 结束绘图 都要用,而它们一个在前一个在后。 */
+static char* xt_shot_pending = NULL;
+static int   xt_in_draw_frame = 0;
+
 void XT_InitWindow(uintptr_t w, uintptr_t h, uintptr_t title) {
+#if defined(__APPLE__)
+    xt_83_selfheal();  /* issue #83:非 ASCII 路径自愈,必须在 GLFW 初始化之前 */
+#endif
     // MSAA 4x:圆角矩形/斜边的 GPU 级抗锯齿(raylib 的 DrawRectangleRounded 是三角形扇
     // 拼合,不开多重采样时边缘台阶感严重)。须在 InitWindow 前设置;取不到多样本
     // 帧缓冲时 GLFW 自动降级,不影响功能。
-    SetConfigFlags(0x00000020); // FLAG_MSAA_4X_HINT
-    InitWindow((int)XT_TO_INT(w), (int)XT_TO_INT(h), xt_get_cstr(title));
+    // HIGHDPI:macOS Retina/Linux 高分屏的 2x framebuffer(issue #22)。须与 MSAA 同批设置。
+    SetConfigFlags(0x00000020 | 0x00002000); // FLAG_MSAA_4X_HINT | FLAG_WINDOW_HIGHDPI
+#ifdef _WIN32
+    // Windows Per-Monitor DPI Aware V2(PMv2,Win10 1703+):窗口跨不同 DPI 显示器拖动时
+    // 由应用按当前显示器 DPI 自行重排,避免系统按缩放比例强制拉伸模糊。V1 及更老档位
+    // (unaware/system DPI aware)吃历史包袱,不作为设计参照(issue #22)。动态取符号:
+    // 旧系统无此接口时静默跳过,不引入链接依赖。
+    {
+        HANDLE user32 = GetModuleHandleA("user32.dll");
+        if (user32) {
+            void* (*fn)(HANDLE) = (void* (*)(HANDLE))GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+            if (fn) fn((HANDLE)(intptr_t)-4); // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+        }
+    }
+#endif
+    InitWindow((int)xt_ni(w), (int)xt_ni(h), xt_get_cstr(title));
+    xt_window_close_requested = 0; /* 新窗口重置"请求关闭"标志(issue #47) */
+    xt_window_closed = 0; /* 新窗口重置"已关闭"幂等标记(issue #56) */
 }
 
 uintptr_t XT_WindowShouldClose(void) {
-    return WindowShouldClose() ? 1 : 0;
+    return (xt_window_close_requested || WindowShouldClose()) ? 1 : 0;
 }
 
 void XT_CloseWindow(void) {
+    if (xt_window_closed) return; /* 幂等:二次调用直接返回(issue #56) */
+    xt_window_closed = 1;
+    if (xt_shot_pending) {
+        fprintf(stderr,
+                "[渲染库][错误] 截图 未产出文件:%s\n"
+                "  已登记,但关闭窗口前没有再次调用 `结束绘图`,没有机会抓帧。\n"
+                "  请把 截图 挪到 `开始绘图` 与 `结束绘图` 之间。\n",
+                xt_shot_pending);
+        free(xt_shot_pending);
+        xt_shot_pending = NULL;
+    }
     CloseWindow();
 }
 
@@ -181,7 +312,7 @@ uintptr_t XT_IsWindowReady(void) {
 }
 
 void XT_SetTargetFPS(uintptr_t fps) {
-    SetTargetFPS((int)XT_TO_INT(fps));
+    SetTargetFPS((int)xt_ni(fps));
 }
 
 uintptr_t XT_GetFPS(void) {
@@ -198,6 +329,36 @@ uintptr_t XT_GetScreenWidth(void) {
 
 uintptr_t XT_GetScreenHeight(void) {
     return XT_FROM_INT(GetScreenHeight());
+}
+
+// framebuffer 物理像素(HIGHDPI 下为屏幕逻辑尺寸 × 缩放比;issue #22 缩放语义)
+uintptr_t XT_GetRenderWidth(void) {
+    return XT_FROM_INT(GetRenderWidth());
+}
+
+uintptr_t XT_GetRenderHeight(void) {
+    return XT_FROM_INT(GetRenderHeight());
+}
+
+// 窗口缩放系数 = framebuffer 物理像素 / 逻辑画布（HIGHDPI @2x 下为 2.0，100% 下为 1.0；issue #22 坐标系抽象）
+uintptr_t XT_GetWindowScale(void) {
+    int sw = GetScreenWidth();
+    if (sw <= 0) return xt_make_float(1.0);
+    return xt_make_float((double)GetRenderWidth() / (double)sw);
+}
+
+// 逻辑单位 → 物理像素（换算在桥内完成，玄铁侧函数体无浮点算术）
+uintptr_t XT_ScaleToPixel(uintptr_t v) {
+    int sw = GetScreenWidth();
+    if (sw <= 0) return xt_make_float(xt_get_float(v));
+    return xt_make_float(xt_get_float(v) * (double)GetRenderWidth() / (double)sw);
+}
+
+// 物理像素 → 逻辑单位（截图工具量出的物理像素反算回逻辑坐标）
+uintptr_t XT_ScaleToLogical(uintptr_t v) {
+    int sw = GetScreenWidth();
+    if (sw <= 0) return xt_make_float(xt_get_float(v));
+    return xt_make_float(xt_get_float(v) * (double)sw / (double)GetRenderWidth());
 }
 
 void XT_SetWindowTitle(uintptr_t title) {
@@ -243,6 +404,12 @@ void XT_SetWindowUndecorated(uintptr_t on) {
 #ifdef _WIN32
     HWND hwnd = (HWND)GetWindowHandle();
     if (!hwnd) return;
+    // 切换风格会改变客户区尺寸(无边框比有边框大);先记住切换前客户区,改完再按它还原,
+    // 否则 UI.应用 用入参宽高布局、真实客户区却是另一份尺寸,右侧/底部被裁。
+    XT_CLIENT_RECT cr = {0, 0, 0, 0};
+    int have_client = GetClientRect(hwnd, &cr);
+    int cw = cr.right - cr.left;
+    int ch = cr.bottom - cr.top;
     intptr_t style = GetWindowLongPtrW(hwnd, XT_GWL_STYLE);
     if (XT_TO_INT(on)) {
         style &= ~(XT_WS_CAPTION | XT_WS_SYSMENU | XT_WS_THICKFRAME | XT_WS_MAXIMIZEBOX);
@@ -252,6 +419,15 @@ void XT_SetWindowUndecorated(uintptr_t on) {
     }
     SetWindowLongPtrW(hwnd, XT_GWL_STYLE, style);
     xt_apply_style(hwnd);
+    // 按切换后的风格反算外部窗口尺寸,让客户区恢复成切换前的大小
+    if (have_client != 0 && cw > 0 && ch > 0) {
+        intptr_t ex = GetWindowLongPtrW(hwnd, XT_GWL_EXSTYLE);
+        XT_CLIENT_RECT wr = {0, 0, cw, ch};
+        if (AdjustWindowRectEx(&wr, (unsigned long)style, 0, (unsigned long)ex)) {
+            SetWindowPos(hwnd, 0, 0, 0, wr.right - wr.left, wr.bottom - wr.top,
+                XT_SWP_NOMOVE | XT_SWP_NOZORDER | XT_SWP_NOACTIVATE | XT_SWP_FRAMECHANGED);
+        }
+    }
 #else
     if (XT_TO_INT(on)) SetWindowState(FLAG_WINDOW_UNDECORATED);
     else ClearWindowState(FLAG_WINDOW_UNDECORATED);
@@ -260,7 +436,7 @@ void XT_SetWindowUndecorated(uintptr_t on) {
 
 void XT_SetWindowFullscreen(uintptr_t on) {
     // 显式语义:目标状态与当前一致时不动作(ToggleFullscreen 只有翻转语义)
-    int want = (int)XT_TO_INT(on);
+    int want = (int)xt_ni(on);
     if ((IsWindowFullscreen() ? 1 : 0) != want) ToggleFullscreen();
 }
 
@@ -269,7 +445,7 @@ uintptr_t XT_IsWindowFullscreen(void) {
 }
 
 void XT_SetWindowSize(uintptr_t w, uintptr_t h) {
-    SetWindowSize((int)XT_TO_INT(w), (int)XT_TO_INT(h));
+    SetWindowSize((int)xt_ni(w), (int)xt_ni(h));
 }
 
 // ESC 关闭开关:开=按 ESC 请求关窗(raylib 默认),关=ESC 不再退程序
@@ -278,11 +454,31 @@ void XT_SetEscExit(uintptr_t on) {
 }
 
 void XT_BeginDrawing(void) {
+    xt_in_draw_frame = 1;
     BeginDrawing();
 }
 
+// 截图取帧前必须 flush rlgl 批次:LoadImageFromScreen 直接 glReadPixels,
+// 不 flush 时本帧尚未提交的图元不在 framebuffer(实测截图缺最后一批绘制)。
+extern void rlDrawRenderBatchActive(void);
+
 void XT_EndDrawing(void) {
+    // issue #92:抓帧必须在交换缓冲之前完成。
+    if (xt_shot_pending) {
+        rlDrawRenderBatchActive();
+        Image img = LoadImageFromScreen();
+        if (img.data) {
+            ExportImage(img, xt_shot_pending);
+            UnloadImage(img);
+        } else {
+            fprintf(stderr, "[渲染库][错误] 截图:无法读取当前帧缓冲,未写出 %s(窗口未初始化或渲染上下文丢失)\n",
+                    xt_shot_pending);
+        }
+        free(xt_shot_pending);
+        xt_shot_pending = NULL;
+    }
     EndDrawing();
+    xt_in_draw_frame = 0;
 }
 
 /* 泵输入事件(不交换缓冲):正常渲染帧由 EndDrawing 内部自动调用;
@@ -295,7 +491,7 @@ void XT_PollInputEvents(void) {
    桥侧记忆当前值,同值重复调用直接返回,避免每帧 glfw 无谓重建/切换 */
 void XT_SetMouseCursor(uintptr_t c) {
     static int last = -1;
-    int v = (int)XT_TO_INT(c);
+    int v = (int)xt_ni(c);
     if (v == last) return;
     last = v;
     SetMouseCursor(v);
@@ -367,13 +563,15 @@ uintptr_t XT_WindowIsMaximized(void) {
 
 /* 优雅关闭:不直接 CloseWindow(帧中销毁上下文,后续绘制即崩),
    Windows 下投递 WM_CLOSE,GLFW 转成 shouldClose,主循环下一轮按正常路径退出;
-   非 Windows 平台退回 CloseWindow(帧末调用方为界) */
+   非 Windows 平台设"请求关闭"标志(xt_window_close_requested),由 XT_WindowShouldClose
+   返回——主循环下一轮正常退出,调用方统一执行一次 CloseWindow(issue #47:
+   直接 CloseWindow 会与 XT_CloseWindow 连用时二次释放 rlUnloadRenderBatch → SIGABRT) */
 void XT_WindowClose(void) {
 #ifdef _WIN32
     void* hwnd = GetWindowHandle();
     if (hwnd) PostMessageW(hwnd, 0x0010 /* WM_CLOSE */, 0, 0);
 #else
-    CloseWindow();
+    xt_window_close_requested = 1;
 #endif
 }
 
@@ -407,10 +605,10 @@ void XT_WindowDrag(void) {
 
 void XT_ClearBackground(uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
     Color c = {
-        (unsigned char)XT_TO_INT(r),
-        (unsigned char)XT_TO_INT(g),
-        (unsigned char)XT_TO_INT(b),
-        (unsigned char)XT_TO_INT(a)
+        (unsigned char)xt_ni(r),
+        (unsigned char)xt_ni(g),
+        (unsigned char)xt_ni(b),
+        (unsigned char)xt_ni(a)
     };
     ClearBackground(c);
 }
@@ -420,53 +618,53 @@ void XT_ClearBackground(uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
 // ============================================================
 
 void XT_DrawPixel(uintptr_t x, uintptr_t y, uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    DrawPixel((int)XT_TO_INT(x), (int)XT_TO_INT(y), c);
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    DrawPixel((int)xt_ni(x), (int)xt_ni(y), c);
 }
 
 void XT_DrawLine(uintptr_t x1, uintptr_t y1, uintptr_t x2, uintptr_t y2,
                  uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    DrawLine((int)XT_TO_INT(x1), (int)XT_TO_INT(y1),
-             (int)XT_TO_INT(x2), (int)XT_TO_INT(y2), c);
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    DrawLine((int)xt_ni(x1), (int)xt_ni(y1),
+             (int)xt_ni(x2), (int)xt_ni(y2), c);
 }
 
 void XT_DrawRectangle(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h,
                       uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    DrawRectangle((int)XT_TO_INT(x), (int)XT_TO_INT(y),
-                  (int)XT_TO_INT(w), (int)XT_TO_INT(h), c);
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    DrawRectangle((int)xt_ni(x), (int)xt_ni(y),
+                  (int)xt_ni(w), (int)xt_ni(h), c);
 }
 
 void XT_DrawRectangleRec(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h,
                          uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    Rectangle rec = {(float)XT_TO_INT(x), (float)XT_TO_INT(y),
-                     (float)XT_TO_INT(w), (float)XT_TO_INT(h)};
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    Rectangle rec = {xt_nf(x), xt_nf(y),
+                     xt_nf(w), xt_nf(h)};
     DrawRectangleRec(rec, c);
 }
 
 void XT_DrawRectangleLines(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h,
                            uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    DrawRectangleLines((int)XT_TO_INT(x), (int)XT_TO_INT(y),
-                       (int)XT_TO_INT(w), (int)XT_TO_INT(h), c);
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    DrawRectangleLines((int)xt_ni(x), (int)xt_ni(y),
+                       (int)xt_ni(w), (int)xt_ni(h), c);
 }
 
 // 圆角矩形:roundPct 为圆角百分比(0-100,对应 raylib roundness 0.0-1.0),segments 固定 12
 void XT_DrawRectangleRounded(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h,
                              uintptr_t roundPct,
                              uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    Rectangle rec = {(float)XT_TO_INT(x), (float)XT_TO_INT(y),
-                     (float)XT_TO_INT(w), (float)XT_TO_INT(h)};
-    float roundness = (float)XT_TO_INT(roundPct) / 100.0f;
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    Rectangle rec = {xt_nf(x), xt_nf(y),
+                     xt_nf(w), xt_nf(h)};
+    float roundness = xt_nf(roundPct) / 100.0f;
     if (roundness < 0.0f) roundness = 0.0f;
     if (roundness > 1.0f) roundness = 1.0f;
     DrawRectangleRounded(rec, roundness, 12, c);
@@ -476,46 +674,46 @@ void XT_DrawRectangleRounded(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h,
 void XT_DrawRectangleRoundedLines(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h,
                                   uintptr_t roundPct, uintptr_t lineThick,
                                   uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    Rectangle rec = {(float)XT_TO_INT(x), (float)XT_TO_INT(y),
-                     (float)XT_TO_INT(w), (float)XT_TO_INT(h)};
-    float roundness = (float)XT_TO_INT(roundPct) / 100.0f;
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    Rectangle rec = {xt_nf(x), xt_nf(y),
+                     xt_nf(w), xt_nf(h)};
+    float roundness = xt_nf(roundPct) / 100.0f;
     if (roundness < 0.0f) roundness = 0.0f;
     if (roundness > 1.0f) roundness = 1.0f;
-    float thick = (float)XT_TO_INT(lineThick);
+    float thick = xt_nf(lineThick);
     if (thick < 1.0f) thick = 1.0f;
     DrawRectangleRoundedLinesEx(rec, roundness, 12, thick, c);
 }
 
 // ---- 千分定点坐标(×1000 → float):亚像素平滑绘制,微交互/动画专用 ----
 // 整数坐标在 2~3px 行程的动画里只剩两三档台阶;小数坐标交给 GPU(MSAA/双线性)逐帧平滑插值。
-static float xt_kf(uintptr_t v) { return (float)XT_TO_INT(v) / 1000.0f; }
+static float xt_kf(uintptr_t v) { return xt_nf(v) / 1000.0f; }
 
 void XT_DrawRectFP(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h,
                    uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
     Rectangle rec = {xt_kf(x), xt_kf(y), xt_kf(w), xt_kf(h)};
     DrawRectangleRec(rec, c);
 }
 
 void XT_DrawRectLinesFP(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h, uintptr_t lineThick,
                         uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
     Rectangle rec = {xt_kf(x), xt_kf(y), xt_kf(w), xt_kf(h)};
-    float thick = (float)XT_TO_INT(lineThick);
+    float thick = xt_nf(lineThick);
     if (thick < 1.0f) thick = 1.0f;
     DrawRectangleLinesEx(rec, thick, c);
 }
 
 void XT_DrawRoundedRectFP(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h, uintptr_t roundPct,
                           uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
     Rectangle rec = {xt_kf(x), xt_kf(y), xt_kf(w), xt_kf(h)};
-    float roundness = (float)XT_TO_INT(roundPct) / 100.0f;
+    float roundness = xt_nf(roundPct) / 100.0f;
     if (roundness < 0.0f) roundness = 0.0f;
     if (roundness > 1.0f) roundness = 1.0f;
     DrawRectangleRounded(rec, roundness, 12, c);
@@ -524,13 +722,13 @@ void XT_DrawRoundedRectFP(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h, ui
 void XT_DrawRoundedRectLinesFP(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h,
                                uintptr_t roundPct, uintptr_t lineThick,
                                uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
     Rectangle rec = {xt_kf(x), xt_kf(y), xt_kf(w), xt_kf(h)};
-    float roundness = (float)XT_TO_INT(roundPct) / 100.0f;
+    float roundness = xt_nf(roundPct) / 100.0f;
     if (roundness < 0.0f) roundness = 0.0f;
     if (roundness > 1.0f) roundness = 1.0f;
-    float thick = (float)XT_TO_INT(lineThick);
+    float thick = xt_nf(lineThick);
     if (thick < 1.0f) thick = 1.0f;
     DrawRectangleRoundedLinesEx(rec, roundness, 12, thick, c);
 }
@@ -539,42 +737,42 @@ void XT_DrawRoundedRectLinesFP(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t 
 
 void XT_DrawCircle(uintptr_t cx, uintptr_t cy, uintptr_t radius,
                    uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    DrawCircle((int)XT_TO_INT(cx), (int)XT_TO_INT(cy), (float)XT_TO_INT(radius), c);
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    DrawCircle((int)xt_ni(cx), (int)xt_ni(cy), xt_nf(radius), c);
 }
 
 void XT_DrawCircleLines(uintptr_t cx, uintptr_t cy, uintptr_t radius,
                         uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    DrawCircleLines((int)XT_TO_INT(cx), (int)XT_TO_INT(cy), (float)XT_TO_INT(radius), c);
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    DrawCircleLines((int)xt_ni(cx), (int)xt_ni(cy), xt_nf(radius), c);
 }
 
 void XT_DrawEllipse(uintptr_t cx, uintptr_t cy, uintptr_t rh, uintptr_t rv,
                     uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    DrawEllipse((int)XT_TO_INT(cx), (int)XT_TO_INT(cy),
-                (float)XT_TO_INT(rh), (float)XT_TO_INT(rv), c);
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    DrawEllipse((int)xt_ni(cx), (int)xt_ni(cy),
+                xt_nf(rh), xt_nf(rv), c);
 }
 
 void XT_DrawTriangle(uintptr_t x1, uintptr_t y1, uintptr_t x2, uintptr_t y2, uintptr_t x3, uintptr_t y3,
                      uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    Vector2 v1 = {(float)XT_TO_INT(x1), (float)XT_TO_INT(y1)};
-    Vector2 v2 = {(float)XT_TO_INT(x2), (float)XT_TO_INT(y2)};
-    Vector2 v3 = {(float)XT_TO_INT(x3), (float)XT_TO_INT(y3)};
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    Vector2 v1 = {xt_nf(x1), xt_nf(y1)};
+    Vector2 v2 = {xt_nf(x2), xt_nf(y2)};
+    Vector2 v3 = {xt_nf(x3), xt_nf(y3)};
     DrawTriangle(v1, v2, v3, c);
 }
 
 void XT_DrawPoly(uintptr_t cx, uintptr_t cy, uintptr_t sides, uintptr_t radius, uintptr_t rotation,
                  uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    Vector2 center = {(float)XT_TO_INT(cx), (float)XT_TO_INT(cy)};
-    DrawPoly(center, (int)XT_TO_INT(sides), (float)XT_TO_INT(radius), (float)XT_TO_INT(rotation), c);
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    Vector2 center = {xt_nf(cx), xt_nf(cy)};
+    DrawPoly(center, (int)xt_ni(sides), xt_nf(radius), xt_nf(rotation), c);
 }
 
 // ============================================================
@@ -583,18 +781,18 @@ void XT_DrawPoly(uintptr_t cx, uintptr_t cy, uintptr_t sides, uintptr_t radius, 
 
 void XT_DrawText(uintptr_t text, uintptr_t x, uintptr_t y, uintptr_t fontSize,
                  uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
-    Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-               (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-    DrawText(xt_get_cstr(text), (int)XT_TO_INT(x), (int)XT_TO_INT(y),
-             (int)XT_TO_INT(fontSize), c);
+    Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+               (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+    DrawText(xt_get_cstr(text), (int)xt_ni(x), (int)xt_ni(y),
+             (int)xt_ni(fontSize), c);
 }
 
 uintptr_t XT_MeasureText(uintptr_t text, uintptr_t fontSize) {
-    return XT_FROM_INT(MeasureText(xt_get_cstr(text), (int)XT_TO_INT(fontSize)));
+    return XT_FROM_INT(MeasureText(xt_get_cstr(text), (int)xt_ni(fontSize)));
 }
 
 void XT_DrawFPS(uintptr_t x, uintptr_t y) {
-    DrawFPS((int)XT_TO_INT(x), (int)XT_TO_INT(y));
+    DrawFPS((int)xt_ni(x), (int)xt_ni(y));
 }
 
 // ============================================================
@@ -604,13 +802,20 @@ void XT_DrawFPS(uintptr_t x, uintptr_t y) {
 // 纹理句柄池:返回 1-based 标记整数索引(与字体句柄同方案)。
 // 历史教训:此前直接返回裸 Texture2D* 指针,玄铁 ARC 会把该值当 XTObject 做
 // retain/release/析构,读取 Texture2D 字段当 magic → 报堆损坏甚至错误释放 C 内存。
-// v1.2.0 起 16→32:UI 图标缓存 + 渐变纹理缓存 + 用户纹理共存,16 槽不够。
-static Texture2D xt_tex_pool[32];
-static int xt_tex_used[32];
+// v1.2.0 起 16→32;v1.3.9 起 32→256:仿微信 demo 实测 40+ 张头像/图标/渐变同时驻留,
+// 池满后 LoadTexture 直接返回 0(不打印失败日志),表现为"部分图标按钮/图片静默不渲染"。
+#define XT_TEX_MAX 256
+static Texture2D xt_tex_pool[XT_TEX_MAX];
+static int xt_tex_used[XT_TEX_MAX];
+static int xt_tex_warned = 0;
 
 static int xt_tex_alloc(void) {
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < XT_TEX_MAX; i++) {
         if (!xt_tex_used[i]) return i;
+    }
+    if (!xt_tex_warned) {
+        xt_tex_warned = 1;
+        fprintf(stderr, "[渲染库][警告] 纹理池已满(%d 个),后续纹理加载会静默失败;请减少同时驻留的纹理或增大池\n", XT_TEX_MAX);
     }
     return -1;
 }
@@ -618,7 +823,7 @@ static int xt_tex_alloc(void) {
 static Texture2D* xt_get_tex(uintptr_t v) {
     if (!IS_INT(v)) return NULL;
     int64_t idx = XT_TO_INT(v);
-    if (idx < 1 || idx > 32) return NULL;
+    if (idx < 1 || idx > XT_TEX_MAX) return NULL;
     if (!xt_tex_used[idx - 1]) return NULL;
     return &xt_tex_pool[idx - 1];
 }
@@ -632,7 +837,26 @@ uintptr_t XT_LoadTexture(uintptr_t filename) {
     const char* ext = strrchr(path, '.');
     if (!ext) ext = ".png";
     int dataSize = 0;
-    unsigned char* data = xt_read_file_bytes(path, &dataSize);
+    unsigned char* data = NULL;
+    // 2x 屏幕(HIGHDPI)自动选 @2x 变体:优先 路径@2x.扩展名,存在则用;否则回退原图(issue #22)。
+    // 命名沿 macOS 惯例(图标@2x.png),与渲染缓冲物理像素匹配;仅 2x 及以上触发,1x 不折腾。
+    {
+        int rw = GetRenderWidth();
+        int sw = GetScreenWidth();
+        if (sw > 0 && rw > sw * 1.5) {
+            char cand[1024];
+            size_t baseLen = (size_t)(ext - path);
+            if (baseLen + 3 + 16 < sizeof(cand)) { // "@2x"(3,不含 null) + 扩展名余量(≤16)
+                memcpy(cand, path, baseLen);
+                memcpy(cand + baseLen, "@2x", 3); // 只复制 '@' '2' 'x'，勿带字面量 null——否则字符串在 @2x 处提前终止
+                strcpy(cand + baseLen + 3, ext);
+                int sz2 = 0;
+                unsigned char* d2 = xt_read_file_bytes(cand, &sz2);
+                if (d2) { data = d2; dataSize = sz2; }
+            }
+        }
+    }
+    if (!data) data = xt_read_file_bytes(path, &dataSize);
     Texture2D tex;
     memset(&tex, 0, sizeof(tex));
     if (data) {
@@ -643,6 +867,10 @@ uintptr_t XT_LoadTexture(uintptr_t filename) {
             UnloadImage(img);
         }
     }
+    // 解码失败/文件缺失/不支持格式 → 返回 0 且不占槽位。
+    // 旧实现照样 marked used 并返回非 0 句柄 → 调用方用 != 0 判断成败会误判成功,
+    // 之后拿着空纹理绘制(issue #44 评论实测:句柄非 0 但尺寸为 0)。
+    if (tex.id == 0) return XT_FROM_INT(0);
     xt_tex_pool[slot] = tex;
     xt_tex_used[slot] = 1;
     return XT_FROM_INT(slot + 1);
@@ -651,7 +879,7 @@ uintptr_t XT_LoadTexture(uintptr_t filename) {
 void XT_UnloadTexture(uintptr_t texPtr) {
     if (!IS_INT(texPtr)) return;
     int64_t idx = XT_TO_INT(texPtr);
-    if (idx < 1 || idx > 32 || !xt_tex_used[idx - 1]) return;
+    if (idx < 1 || idx > XT_TEX_MAX || !xt_tex_used[idx - 1]) return;
     Texture2D* p = &xt_tex_pool[idx - 1];
     UnloadTexture(*p);
     xt_tex_used[idx - 1] = 0;
@@ -660,9 +888,9 @@ void XT_UnloadTexture(uintptr_t texPtr) {
 void XT_DrawTexture(uintptr_t texPtr, uintptr_t x, uintptr_t y, uintptr_t tint_r, uintptr_t tint_g, uintptr_t tint_b, uintptr_t tint_a) {
     Texture2D* p = xt_get_tex(texPtr);
     if (p) {
-        Color tint = {(unsigned char)XT_TO_INT(tint_r), (unsigned char)XT_TO_INT(tint_g),
-                      (unsigned char)XT_TO_INT(tint_b), (unsigned char)XT_TO_INT(tint_a)};
-        DrawTexture(*p, (int)XT_TO_INT(x), (int)XT_TO_INT(y), tint);
+        Color tint = {(unsigned char)xt_ni(tint_r), (unsigned char)xt_ni(tint_g),
+                      (unsigned char)xt_ni(tint_b), (unsigned char)xt_ni(tint_a)};
+        DrawTexture(*p, (int)xt_ni(x), (int)xt_ni(y), tint);
     }
 }
 
@@ -670,13 +898,13 @@ void XT_DrawTextureEx(uintptr_t texPtr, uintptr_t x, uintptr_t y, uintptr_t rota
                       uintptr_t tint_r, uintptr_t tint_g, uintptr_t tint_b, uintptr_t tint_a) {
     Texture2D* p = xt_get_tex(texPtr);
     if (p) {
-        Color tint = {(unsigned char)XT_TO_INT(tint_r), (unsigned char)XT_TO_INT(tint_g),
-                      (unsigned char)XT_TO_INT(tint_b), (unsigned char)XT_TO_INT(tint_a)};
+        Color tint = {(unsigned char)xt_ni(tint_r), (unsigned char)xt_ni(tint_g),
+                      (unsigned char)xt_ni(tint_b), (unsigned char)xt_ni(tint_a)};
         Rectangle src = {0, 0, (float)p->width, (float)p->height};
-        Vector2 pos = {(float)XT_TO_INT(x), (float)XT_TO_INT(y)};
+        Vector2 pos = {xt_nf(x), xt_nf(y)};
         Vector2 origin = {0, 0};
-        DrawTexturePro(*p, src, (Rectangle){pos.x, pos.y, (float)p->width * XT_TO_INT(scale), (float)p->height * XT_TO_INT(scale)},
-                       origin, (float)XT_TO_INT(rotation), tint);
+        DrawTexturePro(*p, src, (Rectangle){pos.x, pos.y, (float)p->width * xt_nf(scale), (float)p->height * xt_nf(scale)},
+                       origin, xt_nf(rotation), tint);
     }
 }
 
@@ -696,10 +924,10 @@ void XT_DrawTextureQuad(uintptr_t texPtr, uintptr_t x, uintptr_t y, uintptr_t w,
                         uintptr_t tint_r, uintptr_t tint_g, uintptr_t tint_b, uintptr_t tint_a) {
     Texture2D* p = xt_get_tex(texPtr);
     if (!p) return;
-    Color tint = {(unsigned char)XT_TO_INT(tint_r), (unsigned char)XT_TO_INT(tint_g),
-                  (unsigned char)XT_TO_INT(tint_b), (unsigned char)XT_TO_INT(tint_a)};
+    Color tint = {(unsigned char)xt_ni(tint_r), (unsigned char)xt_ni(tint_g),
+                  (unsigned char)xt_ni(tint_b), (unsigned char)xt_ni(tint_a)};
     DrawTexturePro(*p, (Rectangle){0, 0, (float)p->width, (float)p->height},
-                   (Rectangle){(float)XT_TO_INT(x), (float)XT_TO_INT(y), (float)XT_TO_INT(w), (float)XT_TO_INT(h)},
+                   (Rectangle){xt_nf(x), xt_nf(y), xt_nf(w), xt_nf(h)},
                    (Vector2){0, 0}, 0.0f, tint);
 }
 
@@ -708,8 +936,8 @@ void XT_DrawTextureQuadFP(uintptr_t texPtr, uintptr_t x, uintptr_t y, uintptr_t 
                           uintptr_t tint_r, uintptr_t tint_g, uintptr_t tint_b, uintptr_t tint_a) {
     Texture2D* p = xt_get_tex(texPtr);
     if (!p) return;
-    Color tint = {(unsigned char)XT_TO_INT(tint_r), (unsigned char)XT_TO_INT(tint_g),
-                  (unsigned char)XT_TO_INT(tint_b), (unsigned char)XT_TO_INT(tint_a)};
+    Color tint = {(unsigned char)xt_ni(tint_r), (unsigned char)xt_ni(tint_g),
+                  (unsigned char)xt_ni(tint_b), (unsigned char)xt_ni(tint_a)};
     DrawTexturePro(*p, (Rectangle){0, 0, (float)p->width, (float)p->height},
                    (Rectangle){xt_kf(x), xt_kf(y), xt_kf(w), xt_kf(h)},
                    (Vector2){0, 0}, 0.0f, tint);
@@ -733,7 +961,7 @@ uintptr_t XT_LoadTextureSVG(uintptr_t filename, uintptr_t w, uintptr_t h) {
         NSVGimage* svg = nsvgParse(buf, "px", 96.0f);
         free(buf);
         if (svg) {
-            int W = (int)XT_TO_INT(w), H = (int)XT_TO_INT(h);
+            int W = (int)xt_ni(w), H = (int)xt_ni(h);
             if (W <= 0) W = (int)svg->width;
             if (H <= 0) H = (int)svg->height;
             if (W > 0 && H > 0 && svg->width > 0 && svg->height > 0) {
@@ -756,6 +984,64 @@ uintptr_t XT_LoadTextureSVG(uintptr_t filename, uintptr_t w, uintptr_t h) {
             nsvgDelete(svg);
         }
     }
+    // 与 加载纹理 对齐:文件缺失 / 解析失败 / 光栅化失败都不该给一个指向空纹理的句柄。
+    // 旧行为无条件返回非 0,调用方以为成功却画出空白,还查不出原因。
+    if (tex.id == 0 || tex.width == 0 || tex.height == 0) {
+        xt_tex_used[slot] = 0;
+        return XT_FROM_INT(0);
+    }
+    xt_tex_pool[slot] = tex;
+    xt_tex_used[slot] = 1;
+    return XT_FROM_INT(slot + 1);
+}
+
+// 从内存里的 SVG 文本加载纹理(内置图标集用:图标数据编译进程序,不依赖外部文件)。
+// 与 XT_LoadTextureSVG 同一套 nanosvg 光栅化;nsvgParse 会原地改缓冲,所以先复制。
+uintptr_t XT_LoadTextureSVGText(uintptr_t svgVal, uintptr_t w, uintptr_t h) {
+    if (!IS_PTR(svgVal)) return XT_FROM_INT(0);
+    int slot = xt_tex_alloc();
+    if (slot < 0) return XT_FROM_INT(0);
+    Texture2D tex;
+    memset(&tex, 0, sizeof(tex));
+    const char* src = xt_get_cstr(svgVal);
+    size_t n = strlen(src);
+    char* buf = (char*)malloc(n + 1);
+    if (buf) {
+        memcpy(buf, src, n + 1);
+        NSVGimage* svg = nsvgParse(buf, "px", 96.0f);
+        free(buf);
+        if (svg) {
+            int W = (int)xt_ni(w), H = (int)xt_ni(h);
+            if (W <= 0) W = (int)svg->width;
+            if (H <= 0) H = (int)svg->height;
+            if (W > 0 && H > 0 && svg->width > 0 && svg->height > 0) {
+                float sc = (float)W / svg->width;
+                float sc2 = (float)H / svg->height;
+                if (sc2 < sc) sc = sc2;
+                unsigned char* rgba = (unsigned char*)calloc((size_t)W * H * 4, 1);
+                if (rgba) {
+                    NSVGrasterizer* rast = nsvgCreateRasterizer();
+                    if (rast) {
+                        nsvgRasterize(rast, svg, 0, 0, sc, rgba, W, H, W * 4);
+                        nsvgDeleteRasterizer(rast);
+                    }
+                    Image img;
+                    img.data = rgba;
+                    img.width = W;
+                    img.height = H;
+                    img.mipmaps = 1;
+                    img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    tex = LoadTextureFromImage(img);
+                    free(rgba);
+                }
+            }
+            nsvgDelete(svg);
+        }
+    }
+    if (tex.id == 0 || tex.width == 0 || tex.height == 0) {
+        xt_tex_used[slot] = 0;
+        return XT_FROM_INT(0);
+    }
     xt_tex_pool[slot] = tex;
     xt_tex_used[slot] = 1;
     return XT_FROM_INT(slot + 1);
@@ -777,15 +1063,15 @@ uintptr_t XT_GenGradientTexture(uintptr_t w, uintptr_t h,
                                 uintptr_t r1, uintptr_t g1, uintptr_t b1, uintptr_t a1,
                                 uintptr_t r2, uintptr_t g2, uintptr_t b2, uintptr_t a2,
                                 uintptr_t dir, uintptr_t radius, uintptr_t feather) {
-    int W = (int)XT_TO_INT(w), H = (int)XT_TO_INT(h);
-    int D = (int)XT_TO_INT(dir), R = (int)XT_TO_INT(radius), F = (int)XT_TO_INT(feather);
+    int W = (int)xt_ni(w), H = (int)xt_ni(h);
+    int D = (int)xt_ni(dir), R = (int)xt_ni(radius), F = (int)xt_ni(feather);
     if (W <= 0 || H <= 0) return XT_FROM_INT(0);
     if (R < 0) R = 0;
     if (F < 1) F = 1;
-    unsigned char c1[4] = {(unsigned char)XT_TO_INT(r1), (unsigned char)XT_TO_INT(g1),
-                           (unsigned char)XT_TO_INT(b1), (unsigned char)XT_TO_INT(a1)};
-    unsigned char c2[4] = {(unsigned char)XT_TO_INT(r2), (unsigned char)XT_TO_INT(g2),
-                           (unsigned char)XT_TO_INT(b2), (unsigned char)XT_TO_INT(a2)};
+    unsigned char c1[4] = {(unsigned char)xt_ni(r1), (unsigned char)xt_ni(g1),
+                           (unsigned char)xt_ni(b1), (unsigned char)xt_ni(a1)};
+    unsigned char c2[4] = {(unsigned char)xt_ni(r2), (unsigned char)xt_ni(g2),
+                           (unsigned char)xt_ni(b2), (unsigned char)xt_ni(a2)};
     if (!xt_grad_init) {
         for (int i = 0; i < 8; i++) xt_grad_cache[i].slot = -1;
         xt_grad_init = 1;
@@ -874,11 +1160,11 @@ uintptr_t XT_GenGradientTexture(uintptr_t w, uintptr_t h,
 // ============================================================
 
 uintptr_t XT_IsKeyDown(uintptr_t key) {
-    return IsKeyDown((int)XT_TO_INT(key)) ? 1 : 0;
+    return IsKeyDown((int)xt_ni(key)) ? 1 : 0;
 }
 
 uintptr_t XT_IsKeyPressed(uintptr_t key) {
-    return IsKeyPressed((int)XT_TO_INT(key)) ? 1 : 0;
+    return IsKeyPressed((int)xt_ni(key)) ? 1 : 0;
 }
 
 uintptr_t XT_GetKeyPressed(void) {
@@ -892,11 +1178,11 @@ uintptr_t XT_GetCharPressed(void) {
 }
 
 uintptr_t XT_IsMouseButtonDown(uintptr_t button) {
-    return IsMouseButtonDown((int)XT_TO_INT(button)) ? 1 : 0;
+    return IsMouseButtonDown((int)xt_ni(button)) ? 1 : 0;
 }
 
 uintptr_t XT_IsMouseButtonPressed(uintptr_t button) {
-    return IsMouseButtonPressed((int)XT_TO_INT(button)) ? 1 : 0;
+    return IsMouseButtonPressed((int)xt_ni(button)) ? 1 : 0;
 }
 
 uintptr_t XT_GetMouseX(void) {
@@ -916,7 +1202,7 @@ uintptr_t XT_GetMouseWheelMove(void) {
 // ============================================================
 
 uintptr_t XT_GetRandomValue(uintptr_t min, uintptr_t max) {
-    return XT_FROM_INT(GetRandomValue((int)XT_TO_INT(min), (int)XT_TO_INT(max)));
+    return XT_FROM_INT(GetRandomValue((int)xt_ni(min), (int)xt_ni(max)));
 }
 
 // ============================================================
@@ -928,7 +1214,28 @@ uintptr_t XT_GetTime(void) {
 }
 
 void XT_WaitTime(uintptr_t seconds) {
-    WaitTime(xt_get_float(seconds));
+    /* issue #95:raylib 的 WaitTime 在部分平台是忙等(GetTime 自旋),macOS 上暂停(秒) 会吃满一个核
+       且不按时返回。这里改用系统休眠:Windows Sleep / POSIX nanosleep,精确且不占 CPU。 */
+    double s = xt_get_float(seconds);
+    if (s <= 0.0) return;
+#ifdef _WIN32
+    /* 分片上限:单次 Sleep 过大会吞掉窗口消息,按 50ms 切片醒来再睡 */
+    {
+        double remain = s;
+        while (remain > 0.0) {
+            double step = remain > 0.05 ? 0.05 : remain;
+            Sleep((unsigned long)(step * 1000.0));
+            remain -= step;
+        }
+    }
+#else
+    {
+        struct timespec ts;
+        ts.tv_sec = (time_t)s;
+        ts.tv_nsec = (long)((s - (double)ts.tv_sec) * 1e9);
+        while (nanosleep(&ts, &ts) == -1) { /* 被信号打断:按剩余时间续睡 */ }
+    }
+#endif
 }
 
 // ============================================================
@@ -943,57 +1250,814 @@ void XT_CloseAudioDevice(void) {
     CloseAudioDevice();
 }
 
+// 音频句柄与纹理/字体统一:槽位池 + XT_FROM_INT(槽号+1),0 表示失败。
+// 历史缺陷(issue #44):这里原先把 calloc 出来的 Sound*/Music* 直接当句柄返回 —— 那是裸 C 指针
+// (LSB=0 且 >4096),玄铁侧 ARC 会把它当堆对象去校验 magic,读到的却是 raylib 结构体,
+// 于是加载任意 wav 都误报"堆损坏或非法指针访问"并退出。句柄是"资源编号"不是"内存地址",
+// 必须走标记整数,这条约定对同库所有句柄外函适用。
+static Sound xt_snd_pool[32];
+static int   xt_snd_used[32];
+static void* xt_synth_pcm[32];   // 合成音效的 PCM 缓冲:LoadSoundFromWave 的拷贝语义在 raylib.h
+                                 // 未言明,保守保活到卸载时再释放(文件音效恒为 NULL)
+static Music xt_mus_pool[32];
+static int   xt_mus_used[32];
+
+/* issue #103:音频 API 依赖 初始化音频()。设备未就绪时只打一次中文提示(不拦截),
+   调用方照旧拿到 0/静默失败——但不再只有 raylib 的英文警告。
+   提示只打一次(静态标志),设备就绪后自然不再出现。 */
+static int xt_audio_hint_printed = 0;
+static void xt_audio_hint(void) {
+    if (IsAudioDeviceReady()) return;
+    if (xt_audio_hint_printed) return;
+    xt_audio_hint_printed = 1;
+    fprintf(stderr,
+            "[渲染库][提示] 音频设备未初始化,请先调用 初始化音频();本次调用将返回失败(句柄 0)。\n");
+}
+
+static int xt_snd_alloc(void) { xt_audio_hint(); for (int i = 0; i < 32; i++) if (!xt_snd_used[i]) return i; return -1; }
+static int xt_mus_alloc(void) { xt_audio_hint(); for (int i = 0; i < 32; i++) if (!xt_mus_used[i]) return i; return -1; }
+
+static Sound* xt_get_snd(uintptr_t v) {
+    if (!IS_INT(v)) return NULL;
+    int64_t idx = XT_TO_INT(v);
+    if (idx < 1 || idx > 32 || !xt_snd_used[idx - 1]) return NULL;
+    return &xt_snd_pool[idx - 1];
+}
+
+static Music* xt_get_mus(uintptr_t v) {
+    if (!IS_INT(v)) return NULL;
+    int64_t idx = XT_TO_INT(v);
+    if (idx < 1 || idx > 32 || !xt_mus_used[idx - 1]) return NULL;
+    return &xt_mus_pool[idx - 1];
+}
+
+// 加载音效,返回 1-32 的标记整数句柄;文件缺失/解码失败/池满 → 0(调用方可可靠判断)
 uintptr_t XT_LoadSound(uintptr_t filename) {
+    int slot = xt_snd_alloc();
+    if (slot < 0) return XT_FROM_INT(0);
     Sound s = LoadSound(xt_get_cstr(filename));
-    Sound* p = (Sound*)calloc(1, sizeof(Sound));
-    *p = s;
-    return (uintptr_t)p;
+    if (s.stream.buffer == NULL || s.frameCount == 0) return XT_FROM_INT(0);
+    xt_snd_pool[slot] = s;
+    xt_snd_used[slot] = 1;
+    return XT_FROM_INT(slot + 1);
 }
 
-void XT_UnloadSound(uintptr_t sndPtr) {
-    if (IS_PTR(sndPtr) && sndPtr != 0) {
-        Sound* p = (Sound*)sndPtr;
-        UnloadSound(*p);
-        free((void*)p);
+void XT_UnloadSound(uintptr_t snd) {
+    Sound* p = xt_get_snd(snd);
+    if (!p) return;
+    UnloadSound(*p);
+    int slot = (int)xt_ni(snd) - 1;
+    if (slot >= 0 && slot < 32 && xt_synth_pcm[slot]) {
+        free(xt_synth_pcm[slot]);
+        xt_synth_pcm[slot] = NULL;
+    }
+    xt_snd_used[slot] = 0;
+}
+
+void XT_PlaySound(uintptr_t snd) {
+    if (!IsAudioDeviceReady()) { xt_audio_hint(); return; }
+    Sound* p = xt_get_snd(snd);
+    if (p) PlaySound(*p);
+}
+
+// 程序化发声(零资产:桥内合成 16 位单声道正弦 PCM,免 wav 文件)——2026-10-04
+// 频率(Hz)/时长(毫秒);10ms 淡入淡出免咔哒;非法入参按默认值钳制(<=0 → 440Hz/120ms,>10s 截到 10s)。
+// 返回与文件音效同一槽位池的句柄(槽号+1),0 表示失败;播放/释放走既有 播音效/释音效。
+uintptr_t XT_SynthSound(uintptr_t freq_hz, uintptr_t ms) {
+    int slot = xt_snd_alloc();
+    if (slot < 0) return XT_FROM_INT(0);
+    double f = xt_get_float(freq_hz);
+    int m = (int)xt_ni(ms);
+    if (f <= 0.0) f = 440.0;
+    if (m <= 0) m = 120;
+    if (m > 10000) m = 10000;
+    const int rate = 22050;
+    int n = (int)((long long)rate * m / 1000);
+    if (n < 1) n = 1;
+    short* pcm = (short*)malloc(sizeof(short) * (size_t)n);
+    if (!pcm) return XT_FROM_INT(0);
+    double w = 2.0 * 3.14159265358979323846 * f / (double)rate;
+    int fade = rate / 100;                       // 10ms
+    if (fade > n / 2) fade = n / 2;
+    for (int i = 0; i < n; i++) {
+        double a = 0.35;                         // 音量留余量
+        if (i < fade) a *= (double)i / (double)fade;
+        if (i >= n - fade) a *= (double)(n - 1 - i) / (double)fade;
+        pcm[i] = (short)(sin(w * (double)i) * a * 32767.0);
+    }
+    Wave wv;
+    wv.frameCount = (unsigned int)n;
+    wv.sampleRate = (unsigned int)rate;
+    wv.sampleSize = 16;
+    wv.channels = 1;
+    wv.data = pcm;
+    Sound s = LoadSoundFromWave(wv);
+    if (s.stream.buffer == NULL || s.frameCount == 0) {
+        free(pcm);
+        return XT_FROM_INT(0);
+    }
+    xt_snd_pool[slot] = s;
+    xt_synth_pcm[slot] = pcm;                    // 保活;XT_UnloadSound 释放
+    xt_snd_used[slot] = 1;
+    return XT_FROM_INT(slot + 1);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 合成器扩展(issue #94)——波形 / ADSR 包络 / EQ / 延迟 / 混响
+// 波形: 0=正弦 1=三角 2=锯齿 3=方波 4=白噪;音量 0~1;
+// 包络: 起音/衰减/释音 毫秒,延持电平 0~1(全 0 时退化为原 10ms 淡入淡出);
+// EQ: 低/中/高 三带 peaking 增益 dB(0=直通);
+// 延迟: 时间毫秒(0=关),反馈 0~1,混合 0~1;
+// 混响: 房间大小 0~1(0=关),湿干比 0~1。
+// 返回与文件音效同一槽位池的句柄(槽号+1),0 表示失败;播放/释放走既有 播音效/释音效。
+// ═══════════════════════════════════════════════════════════════
+
+// 确定性白噪 LCG(同输入同输出,便于复现)
+static unsigned long xt_rng_state = 2463534242UL;
+static double xt_rng_next(void) {
+    xt_rng_state = xt_rng_state * 1664525UL + 1013904223UL;
+    return (double)((xt_rng_state >> 16) & 0x7FFF) / 32767.0 * 2.0 - 1.0;
+}
+
+// 单振荡器波形采样(相位角 rad):0=正弦 1=三角 2=锯齿 3=方波 4=白噪
+// polyBLEP 带限修正窗:消除锯齿/方波在 Nyquist 之上的谐波混叠折叠(短周期"抖动"根因)
+// 听感验收(2026-10-20):修复后 450Hz 混叠杂散 161.8→2.5,抖动消除;方波≈FL 3xOsc 方波套 5735Hz 61% 低通(FL EQ2 实测对比),
+//   柔和但干净——22050 Nyquist 上限 + polyBLEP 滚降所致,用户拍板保持现状。详见 docs/波形带限与听感验收记录.md
+static double xt_poly_blep(double t, double dt) {
+    if (t < dt) {
+        t /= dt;
+        return t + t - t * t - 1.0;
+    } else if (t > 1.0 - dt) {
+        t = (t - 1.0) / dt;
+        return t * t + t + t + 1.0;
+    }
+    return 0.0;
+}
+static double xt_osc_sample(int wave, double ph, double dt) {
+    const double tau = 2.0 * 3.14159265358979323846;
+    switch (wave) {
+        case 1: { // 三角
+            double p = fmod(ph, tau);
+            return 4.0 * fabs(p / tau - 0.5) - 1.0; }
+        case 2: { // 锯齿(上升)+ polyBLEP 带限
+            double t = fmod(ph, tau) / tau;
+            return 2.0 * t - 1.0 - xt_poly_blep(t, dt); }
+        case 3: { // 方波(50% 占空)+ polyBLEP 带限
+            double t = fmod(ph, tau) / tau;
+            double v = (t < 0.5) ? 1.0 : -1.0;
+            return v + xt_poly_blep(t, dt) - xt_poly_blep(fmod(t + 0.5, 1.0), dt); }
+        case 4:  return xt_rng_next();                 // 白噪
+        default: return sin(ph);                       // 正弦
     }
 }
 
-void XT_PlaySound(uintptr_t sndPtr) {
-    if (IS_PTR(sndPtr) && sndPtr != 0) {
-        PlaySound(*(Sound*)sndPtr);
+// 简易双二阶 peaking 滤波(transposed direct form II)
+typedef struct { double b0, b1, b2, a1, a2, z1, z2; } XtPeak;
+static void xt_peak_init(XtPeak* p, double f0, double q, double gain_db, double fs) {
+    double A = pow(10.0, gain_db / 40.0);
+    double w0 = 2.0 * 3.14159265358979323846 * f0 / fs;
+    double cs = cos(w0), sn = sin(w0), alpha = sn / (2.0 * q);
+    double a0 = 1.0 + alpha / A;
+    p->b0 = (1.0 + alpha * A) / a0;
+    p->b1 = (-2.0 * cs) / a0;
+    p->b2 = (1.0 - alpha * A) / a0;
+    p->a1 = (-2.0 * cs) / a0;
+    p->a2 = (1.0 - alpha / A) / a0;
+    p->z1 = p->z2 = 0.0;
+}
+static double xt_peak_run(XtPeak* p, double x) {
+    double y = p->b0 * x + p->z1;
+    p->z1 = p->b1 * x - p->a1 * y + p->z2;
+    p->z2 = p->b2 * x - p->a2 * y;
+    return y;
+}
+
+// freeverb 简化混响(mono: 4 comb + 2 allpass;tunings 按 22050 采样率折算)
+typedef struct { double* buf; int idx, size; double fb, damp, damp_lp; double mod_ph, mod_sp; } XtComb;
+// 混响坑位备忘(完整版:docs/混响实现踩坑记录.md, issue #94):
+// - freeverb(comb+allpass) 尾音金属薄钢板感 → 换 FDN,勿回退
+// - FDN 线长须质数互质,否则模态拍频"起伏/双音"
+// - allpass 必须全通(分子带 fb):缺 fb 高频增益>1 = 放大器 → 尾音饱和方块波"甩水"
+// - 湿音增益从输出侧补,勿靠注入硬顶(tanh 饱和 = 方块波)
+typedef struct { double* buf; int idx, size; double fb; double mod_ph, mod_sp; } XtAllpass;
+typedef struct { double* buf; int idx, size; } XtDelay;
+// FDN 反馈延迟网络(issue #94 混响升级:8 线交叉互连,能量循环扩散,无 comb 金属共振)
+static void xt_allpass_init(XtAllpass* a, int samples);   // 前向声明(xt_fdn_init 调用在定义前)
+static double xt_allpass_run(XtAllpass* a, double x);   // 前向声明:xt_fdn_step 线内扩散使用
+typedef struct { double* buf; int idx, size; double damp, damp_lp; double mod_ph, mod_sp; XtAllpass ap; } XtFdnLine;   // 线内 allpass 扩散:打破梳状模态,频谱平滑
+static void xt_fdn_init(XtFdnLine* L, int samples) {
+    L->buf = (double*)calloc((size_t)samples, sizeof(double));
+    L->size = samples; L->idx = 0; L->damp = 0.35; L->damp_lp = 0.0;   // 反馈低通加深:模态共振钝化
+    L->mod_ph = (double)(samples % 97) * 0.13; L->mod_sp = 0.00005;   // 慢速 LFO 打散模态拍频
+    xt_allpass_init(&L->ap, 60);   // 线内扩散器(60 采样=2.7ms):共振模态真正打散,甩水回声雾化
+}
+// 单步:读 8 线输出(经阻尼低通),Householder 正交矩阵反馈,干音注入线 0
+static void xt_fdn_step(double* out, XtFdnLine* L, double x, double g) {
+    double s[16], sum = 0.0;
+    for (int i = 0; i < 16; i++) {
+        double o = xt_allpass_run(&L[i].ap, L[i].buf[L[i].idx]);
+        L[i].damp_lp = o * (1.0 - L[i].damp) + L[i].damp_lp * L[i].damp;
+        s[i] = L[i].damp_lp; sum += s[i]; out[i] = o;
+    }
+    for (int i = 0; i < 16; i++) {
+        double fb = s[i] - 0.125 * sum;   // (I - 2/N·J)·s:Householder 正交扩散
+        double w = fb * g;
+        if (i == 0) w += 1.0 * x;   // 注入保持 1.0:过载会让尾音 tanh 饱和削平(甩水/铁板听感)
+        int wi = L[i].idx + (int)(2.5 * sin(L[i].mod_ph));   // LFO 漂移模态,打散拍频
+        if (wi < 0) wi += L[i].size; if (wi >= L[i].size) wi -= L[i].size;
+        L[i].buf[wi] = w;
+        L[i].mod_ph += L[i].mod_sp;
+        L[i].idx++; if (L[i].idx >= L[i].size) L[i].idx = 0;
     }
 }
 
+static void xt_comb_init(XtComb* c, int samples) {
+    c->buf = (double*)calloc((size_t)samples, sizeof(double));
+    c->size = samples; c->idx = 0; c->fb = 0.0; c->damp = 0.7; c->damp_lp = 0.0;
+    c->mod_ph = (double)(samples % 97) * 0.17; c->mod_sp = 0.00005;   // 慢速 LFO 打破静态梳状峰
+}
+static double xt_comb_run(XtComb* c, double x) {
+    double out = c->buf[c->idx];
+    c->damp_lp = out * (1.0 - c->damp) + c->damp_lp * c->damp;
+    int wi = c->idx + (int)(1.5 * sin(c->mod_ph));
+    if (wi < 0) wi += c->size; if (wi >= c->size) wi -= c->size;
+    c->buf[wi] = x + c->damp_lp * c->fb;
+    c->mod_ph += c->mod_sp;
+    c->idx++; if (c->idx >= c->size) c->idx = 0;
+    return out;
+}
+static void xt_allpass_init(XtAllpass* a, int samples) {
+    a->buf = (double*)calloc((size_t)samples, sizeof(double));
+    a->size = samples; a->idx = 0; a->fb = 0.65;   // 扩散反馈增强
+    a->mod_ph = (double)(samples % 53) * 0.29; a->mod_sp = 0.00004;   // 慢速 LFO 扩散
+}
+static double xt_allpass_run(XtAllpass* a, double x) {
+    double out = -a->fb * x + a->buf[a->idx];   // 全通必需:分子带 fb,否则高频增益 >1 变放大器(甩水/铁板根因)
+    int wi = a->idx + (int)(1.0 * sin(a->mod_ph));
+    if (wi < 0) wi += a->size; if (wi >= a->size) wi -= a->size;
+    a->buf[wi] = x + out * a->fb;
+    a->mod_ph += a->mod_sp;
+    a->idx++; if (a->idx >= a->size) a->idx = 0;
+    return out;
+}
+static void xt_delay_init(XtDelay* d, int samples) {
+    d->buf = (double*)calloc((size_t)samples, sizeof(double));
+    d->size = samples; d->idx = 0;
+}
+static double xt_delay_run(XtDelay* d, double x) {
+    double out = d->buf[d->idx];
+    d->buf[d->idx] = x;
+    d->idx++; if (d->idx >= d->size) d->idx = 0;
+    return out;
+}
+
+uintptr_t XT_SynthSoundEx(uintptr_t freq_hz, uintptr_t ms, uintptr_t wave, uintptr_t vol,
+                          uintptr_t atk_ms, uintptr_t dec_ms, uintptr_t sus_lvl, uintptr_t rel_ms,
+                          uintptr_t bass_db, uintptr_t mid_db, uintptr_t treb_db,
+                          uintptr_t dly_ms, uintptr_t dly_fb, uintptr_t dly_mix,
+                          uintptr_t rev_room, uintptr_t rev_mix) {
+    int slot = xt_snd_alloc();
+    if (slot < 0) return XT_FROM_INT(0);
+    double f = xt_get_float(freq_hz);
+    int m = (int)xt_ni(ms);
+    int wv = (int)xt_ni(wave);
+    double v  = xt_get_float(vol);
+    double atk = xt_get_float(atk_ms), dec = xt_get_float(dec_ms);
+    double sus = xt_get_float(sus_lvl), rel = xt_get_float(rel_ms);
+    double bdb = xt_get_float(bass_db), mdb = xt_get_float(mid_db), tdb = xt_get_float(treb_db);
+    double dly = xt_get_float(dly_ms), dfb = xt_get_float(dly_fb), dmx = xt_get_float(dly_mix);
+    double rrm = xt_get_float(rev_room), rmx = xt_get_float(rev_mix);
+    // 钳制
+    if (f <= 0.0) f = 440.0;
+    if (m <= 0) m = 120;
+    if (m > 10000) m = 10000;
+    if (wv < 0) wv = 0; if (wv > 4) wv = 4;
+    if (v <= 0.0) v = 0.35; if (v > 1.0) v = 1.0;
+    if (atk < 0.0) atk = 0.0; if (dec < 0.0) dec = 0.0; if (rel < 0.0) rel = 0.0;
+    if (sus < 0.0) sus = 0.0; if (sus > 1.0) sus = 1.0;
+    if (bdb < -24.0) bdb = -24.0; if (bdb > 24.0) bdb = 24.0;
+    if (mdb < -24.0) mdb = -24.0; if (mdb > 24.0) mdb = 24.0;
+    if (tdb < -24.0) tdb = -24.0; if (tdb > 24.0) tdb = 24.0;
+    if (dly < 0.0) dly = 0.0; if (dly > 2000.0) dly = 2000.0;
+    if (dfb < 0.0) dfb = 0.0; if (dfb > 0.95) dfb = 0.95;
+    if (dmx < 0.0) dmx = 0.0; if (dmx > 1.0) dmx = 1.0;
+    if (rrm < 0.0) rrm = 0.0; if (rrm > 0.95) rrm = 0.95;
+    if (rmx < 0.0) rmx = 0.0; if (rmx > 1.0) rmx = 1.0;
+
+    const int rate = 22050;
+    int n = (int)((long long)rate * m / 1000);
+    if (n < 1) n = 1;
+    short* pcm = (short*)malloc(sizeof(short) * (size_t)n);
+    if (!pcm) return XT_FROM_INT(0);
+    double w = 2.0 * 3.14159265358979323846 * f / (double)rate;
+
+    // 包络样本数(起音/衰减/释音),延持段为两者之间
+    int a_n = (int)(rate * atk / 1000.0);
+    int d_n = (int)(rate * dec / 1000.0);
+    int r_n = (int)(rate * rel / 1000.0);
+    if (a_n > n / 2) a_n = n / 2;
+    if (d_n > n - a_n - r_n) d_n = (n - a_n - r_n > 0) ? (n - a_n - r_n) : 0;
+    if (r_n > n - a_n - d_n) r_n = (n - a_n - d_n > 0) ? (n - a_n - d_n) : 0;
+    // 包络缺省退化:全 0 → 原 10ms 淡入淡出
+    if (a_n == 0 && d_n == 0 && r_n == 0 && sus >= 1.0) {
+        int fade = rate / 100;
+        if (fade > n / 2) fade = n / 2;
+        a_n = fade; r_n = fade;
+    }
+
+    // EQ 三带
+    XtPeak eqL, eqM, eqT;
+    xt_peak_init(&eqL, 200.0, 0.7, bdb, (double)rate);
+    xt_peak_init(&eqM, 1000.0, 0.7, mdb, (double)rate);
+    xt_peak_init(&eqT, 5000.0, 0.7, tdb, (double)rate);
+
+    // 延迟/混响(0 值即关闭)
+    XtDelay dline;   XtDelay* dp = NULL;
+    XtFdnLine fl[16]; int ccount = 0;   // FDN 8 线(issue #94 混响升级,无 comb 金属共振)
+    double fg = 0.28 + rrm * 0.7; if (fg > 0.95) fg = 0.95;   // FDN 反馈增益
+    double tail_lp = 0.0;   // 尾音一阶低通状态:压共振金属感
+    XtAllpass ap[16]; int acount = 0;
+    if (dly > 0.0) {
+        int dn = (int)(rate * dly / 1000.0);
+        if (dn < 1) dn = 1;
+        xt_delay_init(&dline, dn); dp = &dline;
+    }
+    if (rrm > 0.0) {
+        static const int fdn_t[16] = { 349, 367, 389, 409, 431, 457, 479, 499, 521, 547, 571, 599, 619, 647, 683, 733 };  // 16 质数线 15.8-33.2ms,房间空间更大
+        static const int ap_t[16]   = { 278, 221, 171, 113, 65, 41, 31, 23, 17, 13, 11, 7, 5, 3, 2, 1 };  // 16 级深度扩散
+        for (int i = 0; i < 16; i++) { xt_fdn_init(&fl[i], fdn_t[i]); ccount++; }
+        for (int i = 0; i < 16; i++) { xt_allpass_init(&ap[i], ap_t[i]); acount++; }
+    }
+
+    for (int i = 0; i < n; i++) {
+        // 1) 波形
+        double s = xt_osc_sample(wv, w * (double)i, w / (2.0 * 3.14159265358979323846));
+        // 2) ADSR 包络 × 音量
+        double env;
+        if (i < a_n) env = (double)i / (double)a_n;
+        else if (i < a_n + d_n) env = 1.0 - (1.0 - sus) * ((double)(i - a_n) / (double)d_n);
+        else if (i >= n - r_n) env = sus * (double)(n - 1 - i) / (double)r_n;
+        else env = sus;
+        s *= v * env;
+        // 3) EQ 三带
+        s = xt_peak_run(&eqL, s);
+        s = xt_peak_run(&eqM, s);
+        s = xt_peak_run(&eqT, s);
+        // 4) 延迟(输入 = 原声 + 反馈回声)
+        if (dp) {
+            double e = xt_delay_run(dp, s + (dp->idx < dp->size ? dp->buf[dp->idx] : 0.0) * dfb);
+            s = s * (1.0 - dmx) + e * dmx;
+        }
+        // 5) 混响(4 comb + 2 allpass,湿干混合)
+        if (ccount > 0) {
+            double wet = 0.0;
+            double fouts[16];
+            xt_fdn_step(fouts, fl, s, fg);
+            for (int k = 0; k < 16; k++) wet += fouts[k];
+            wet /= 16.0;
+            wet *= 3.0;   // 湿音输出侧增益补偿(全通修复后无放大,可安全提响)
+            for (int k = 0; k < acount; k++) wet = xt_allpass_run(&ap[k], wet);
+            tail_lp = wet * 0.47 + tail_lp * 0.53;
+            wet = tail_lp;
+            if (i < 882) wet *= (double)i / 882.0;   // 湿音 40ms 渐入,消除起始瞬态敲击(水滴铁板)
+            s = s * (1.0 - rmx * 0.5) + wet * (rmx * 0.5);   // 干音期湿音压 50%:水滴可控且混响有参与感;尾音期全开
+        }
+        // 6) 软限幅防爆音
+        s = tanh(s);
+        pcm[i] = (short)(s * 32767.0);
+    }
+    // 效果尾音:音符结束后延迟/混响继续输出(留白回声),避免尾音被音效长度硬切
+    if (dp || ccount > 0) {
+        int tail = 0;
+        if (dp) { int td = (int)(rate * dly / 1000.0) * 5; if (td > tail) tail = td; }
+        if (ccount > 0) {
+                // 动态尾长:高反馈房间衰减慢,尾长按最长 comb 衰减到 -66dB 计算,避免尾音硬截止
+                double fbmax = 0.28 + rrm * 0.7; if (fbmax > 0.95) fbmax = 0.95;
+                int tr = (int)(rate * 2.0);
+                if (fbmax > 0.90) {
+                    double period = 733.0 / rate;   // 最长 FDN 线(与 fdn_t[15] 同步)
+                    double ncyc = log(0.0005) / log(fbmax);
+                    int need = (int)(period * ncyc * rate);
+                    if (need > tr) tr = need;
+                }
+                if (tr > tail) tail = tr;
+            }
+        if (tail > 0) {
+            int total = n + tail;
+            short* npcm = (short*)realloc(pcm, sizeof(short) * (size_t)total);
+            if (npcm) {
+                pcm = npcm;
+                for (int j = n; j < total; j++) {
+                    double s = 0.0;   // 音符已结束,只输出效果尾音
+                    if (dp) {
+                        double e = xt_delay_run(dp, s + (dp->idx < dp->size ? dp->buf[dp->idx] : 0.0) * dfb);
+                        s = s * (1.0 - dmx) + e * dmx;
+                    }
+                    if (ccount > 0) {
+                        double wet = 0.0;
+                        double fouts[16];
+                        xt_fdn_step(fouts, fl, s, fg);
+                        wet = 0.0;
+                        for (int k = 0; k < 16; k++) wet += fouts[k];
+                        wet /= 16.0;
+                        wet *= 10.0;   // 尾音期湿音放大:尾音是混响主体(干音期保持 3.0)
+                        for (int k = 0; k < acount; k++) wet = xt_allpass_run(&ap[k], wet);
+                        s = s * (1.0 - rmx) + wet * rmx;
+                    }
+                    if (ccount > 0) {
+                        tail_lp = s * 0.47 + tail_lp * 0.53;   // ~2.2kHz 一阶低通,压尾音金属共振(钢板模态在中低频)
+                        s = tail_lp;
+                        int fade_n = (int)(rate * 0.3);
+                        if (fade_n > 0 && (total - j) < fade_n) s = s * ((double)(total - j) / fade_n);
+                    }
+                    s = tanh(s);
+                    pcm[j] = (short)(s * 32767.0);
+                }
+                n = total;
+            }
+        }
+    }
+    // 调试导出:环境变量 XT_WAVE_DUMP 存在时写 raw PCM(16bit mono),用于尾音时域分析
+    if (getenv("XT_WAVE_DUMP")) {
+        FILE* fd = fopen(getenv("XT_WAVE_DUMP"), "wb");
+        if (fd) { fwrite(pcm, sizeof(short), (size_t)n, fd); fclose(fd); }
+    }
+    // 释放效果器缓冲
+    if (dp) { free(dp->buf); }
+    for (int k = 0; k < ccount; k++) { free(fl[k].buf); free(fl[k].ap.buf); }
+    for (int k = 0; k < acount; k++) free(ap[k].buf);
+
+    Wave wv2;
+    wv2.frameCount = (unsigned int)n;
+    wv2.sampleRate = (unsigned int)rate;
+    wv2.sampleSize = 16;
+    wv2.channels = 1;
+    wv2.data = pcm;
+    Sound s2 = LoadSoundFromWave(wv2);
+    if (s2.stream.buffer == NULL || s2.frameCount == 0) {
+        free(pcm);
+        return XT_FROM_INT(0);
+    }
+    xt_snd_pool[slot] = s2;
+    xt_synth_pcm[slot] = pcm;                    // 保活;XT_UnloadSound 释放
+    xt_snd_used[slot] = 1;
+    return XT_FROM_INT(slot + 1);
+}
+
+// 扫频带通(issue #94 扩展)——白噪等波形通过中心频率随时间扫动的 SVF 带通 = 风声/呜咽
+// 方向: 0 升(起始→终止) 1 降(终止→起始) 2 往复(升→降往返,呜咽感)
+typedef struct { double f, q, low, band; } XtSvf;
+static double xt_svf_bp(XtSvf* sv, double in) {
+    double low = sv->low, band = sv->band;
+    low += sv->f * band;
+    double high = in - low - sv->q * band;
+    band += sv->f * high;
+    sv->low = low; sv->band = band;
+    return band;
+}
+uintptr_t XT_SynthSoundSweep(uintptr_t freq_hz, uintptr_t ms, uintptr_t wave, uintptr_t vol,
+                             uintptr_t f0h, uintptr_t f1h, uintptr_t qh, uintptr_t dir) {
+    int slot = xt_snd_alloc();
+    if (slot < 0) return XT_FROM_INT(0);
+    double f = xt_get_float(freq_hz);
+    int m = (int)xt_ni(ms);
+    int wv = (int)xt_ni(wave);
+    double v = xt_get_float(vol);
+    double f0 = xt_get_float(f0h), f1 = xt_get_float(f1h);
+    double q = xt_get_float(qh); double q_target = q;   // 带宽平滑目标(随机段切换时渐变,避免爆音)
+    int d = (int)xt_ni(dir);
+    if (f <= 0.0) f = 440.0;
+    if (m <= 0) m = 120;
+    if (m > 10000) m = 10000;
+    if (wv < 0) wv = 0; if (wv > 4) wv = 4;
+    if (v <= 0.0) v = 0.35; if (v > 1.0) v = 1.0;
+    if (f0 < 20.0) f0 = 20.0; if (f0 > 8000.0) f0 = 8000.0;
+    if (f1 < 20.0) f1 = 20.0; if (f1 > 8000.0) f1 = 8000.0;
+    if (q <= 0.0) q = 0.8; if (q > 4.0) q = 4.0; if (q < 0.02) q = 0.02;
+    if (d < 0) d = 0; if (d > 4) d = 4;
+    const int rate = 22050;
+    int n = (int)((long long)rate * m / 1000);
+    if (n < 1) n = 1;
+    short* pcm = (short*)malloc(sizeof(short) * (size_t)n);
+    if (!pcm) return XT_FROM_INT(0);
+    double w = 2.0 * 3.14159265358979323846 * f / (double)rate;
+    double ph = 0.0;
+    unsigned int rng = (unsigned int)time(NULL) ^ (unsigned int)((uintptr_t)pcm >> 4) ^ 0x9e3779b9u;   // 每次调用种子不同(每次播放随机)
+    double fc = (f0 + f1) * 0.5, seg_from = fc, seg_to = fc; int seg_i = 1, seg_len = 1, pause_left = 0;   // 随机滑行状态(含随机停顿)
+    XtSvf sv; sv.f = 0.0; sv.q = q; sv.low = 0.0; sv.band = 0.0;
+    int fade = rate / 100; if (fade > n / 2) fade = n / 2;
+    for (int i = 0; i < n; i++) {
+        double x;
+        if (wv == 4) {
+            rng = rng * 1664525u + 1013904223u;
+            x = ((double)(rng >> 8) / 16777216.0) * 2.0 - 1.0;
+        } else {
+            if (wv == 0) x = sin(ph);
+            else if (wv == 1) x = (ph < 3.14159265358979323846) ? ph / 3.14159265358979323846 * 2.0 - 1.0 : 1.0 - (ph - 3.14159265358979323846) / 3.14159265358979323846 * 2.0;
+            else if (wv == 2) x = ph / 3.14159265358979323846 * 2.0 - 1.0;
+            else x = (ph < 3.14159265358979323846) ? 1.0 : -1.0;
+            ph += w;
+            if (ph >= 2.0 * 3.14159265358979323846) ph -= 2.0 * 3.14159265358979323846;
+        }
+        double t = (double)i / (double)(n - 1);
+        double tt = t;
+        double fc;
+        if (d == 3) {   // 随机滑行:每段 600~1200ms 滑到随机端点,方向/范围/速度随机;30% 概率随机停顿 200~600ms;带宽(共振)每段 5%~25% 随机
+            if (seg_i >= seg_len) {
+                if (pause_left <= 0 && ((double)(rng >> 8) / 16777216.0) < 0.3) {
+                    pause_left = (int)(rate * (0.2 + ((double)(rng >> 8) / 16777216.0) * 0.4));
+                }
+                if (pause_left > 0) {
+                    pause_left--;
+                } else {
+                    seg_from = fc;
+                    seg_to = f0 + (f1 - f0) * ((double)(rng >> 8) / 16777216.0);
+                    seg_len = (int)(rate * (0.6 + ((double)(rng >> 8) / 16777216.0) * 0.6));
+                    if (seg_len < 1) seg_len = 1;
+                    seg_i = 0;
+                    q_target = 0.025 + ((double)(rng >> 8) / 16777216.0) * 0.1;   // 带宽 5%~25% 随机(渐变到达)
+                }
+            }
+            fc = seg_from + (seg_to - seg_from) * ((double)seg_i / (double)seg_len);
+            seg_i++;
+        } else if (d == 4) {   // 静止:中心频率固定(长期铺垫氛围,如 180Hz 低频风声底)
+            fc = f0;
+        } else {
+            if (d == 1) tt = 1.0 - t;
+            else if (d == 2) tt = (t < 0.5) ? t * 2.0 : (1.0 - t) * 2.0;
+            fc = f0 + (f1 - f0) * tt;
+        }
+        sv.f = 2.0 * sin(3.14159265358979323846 * fc / (double)rate);
+        sv.q += (q_target - sv.q) * 0.001;   // 带宽平滑过渡(~45ms),消除段切换爆音
+        double y = xt_svf_bp(&sv, x) * (2.0 * sv.q) * 0.5;   // 归一留峰值余量:噪声峰值因子高,全幅会顶满饱和(炸麦)
+        double env = 1.0;
+        if (i < fade) env = (double)i / (double)fade;
+        if (i > n - fade) env = (double)(n - i) / (double)fade;
+        double s = tanh(y * v * 2.0) / tanh(2.0) * 32767.0;   // 温和软限幅(不方波化)
+        s *= env;
+        if (s > 32767.0) s = 32767.0;
+        if (s < -32767.0) s = -32767.0;
+        pcm[i] = (short)s;
+    }
+    Wave wv2;
+    wv2.frameCount = (unsigned int)n;
+    wv2.sampleRate = (unsigned int)rate;
+    wv2.sampleSize = 16;
+    wv2.channels = 1;
+    wv2.data = pcm;
+    Sound s2 = LoadSoundFromWave(wv2);
+    if (s2.stream.buffer == NULL || s2.frameCount == 0) {
+        free(pcm);
+        return XT_FROM_INT(0);
+    }
+    xt_snd_pool[slot] = s2;
+    xt_synth_pcm[slot] = pcm;
+    xt_snd_used[slot] = 1;
+    return XT_FROM_INT(slot + 1);
+}
+
+// 合成器多振荡器(issue #94 扩展)——固定 4 槽,振荡器数 1~4,每槽 波形/音量/频率比;
+// 槽音量 0 = 未显式给 → 自动均分(每槽 0.35/n,与单振荡器默认响度一致);
+// 频率比 = 相对基频倍数(1=同频, 2=高八度, 0.5=低八度);
+// 包络/EQ/延迟/混响 参数与 XT_SynthSoundEx 完全一致,全局作用于混合后整体。
+uintptr_t XT_SynthSoundMulti(uintptr_t freq_hz, uintptr_t ms, uintptr_t osc_count,
+                             uintptr_t w1, uintptr_t v1, uintptr_t r1,
+                             uintptr_t w2, uintptr_t v2, uintptr_t r2,
+                             uintptr_t w3, uintptr_t v3, uintptr_t r3,
+                             uintptr_t w4, uintptr_t v4, uintptr_t r4,
+                             uintptr_t atk_ms, uintptr_t dec_ms, uintptr_t sus_lvl, uintptr_t rel_ms,
+                             uintptr_t bass_db, uintptr_t mid_db, uintptr_t treb_db,
+                             uintptr_t dly_ms, uintptr_t dly_fb, uintptr_t dly_mix,
+                             uintptr_t rev_room, uintptr_t rev_mix) {
+    int slot = xt_snd_alloc();
+    if (slot < 0) return XT_FROM_INT(0);
+    double f = xt_get_float(freq_hz);
+    int m = (int)xt_ni(ms);
+    int cnt = (int)xt_ni(osc_count);
+    if (f <= 0.0) f = 440.0;
+    if (m <= 0) m = 120;
+    if (m > 10000) m = 10000;
+    if (cnt < 1) cnt = 1; if (cnt > 4) cnt = 4;
+
+    int    wv[4] = { (int)xt_ni(w1), (int)xt_ni(w2), (int)xt_ni(w3), (int)xt_ni(w4) };
+    double vv[4] = { xt_get_float(v1), xt_get_float(v2), xt_get_float(v3), xt_get_float(v4) };
+    double rr[4] = { xt_get_float(r1), xt_get_float(r2), xt_get_float(r3), xt_get_float(r4) };
+    for (int k = 0; k < 4; k++) {
+        if (wv[k] < 0) wv[k] = 0; if (wv[k] > 4) wv[k] = 4;
+        if (rr[k] <= 0.0) rr[k] = 1.0; if (rr[k] > 20.0) rr[k] = 20.0;
+        if (vv[k] <= 0.0) vv[k] = 0.35 / (double)cnt;   // 自动均分,总响度与单振荡器默认一致
+        if (vv[k] > 1.0) vv[k] = 1.0;
+    }
+
+    double atk = xt_get_float(atk_ms), dec = xt_get_float(dec_ms);
+    double sus = xt_get_float(sus_lvl), rel = xt_get_float(rel_ms);
+    double bdb = xt_get_float(bass_db), mdb = xt_get_float(mid_db), tdb = xt_get_float(treb_db);
+    double dly = xt_get_float(dly_ms), dfb = xt_get_float(dly_fb), dmx = xt_get_float(dly_mix);
+    double rrm = xt_get_float(rev_room), rmx = xt_get_float(rev_mix);
+    if (atk < 0.0) atk = 0.0; if (dec < 0.0) dec = 0.0; if (rel < 0.0) rel = 0.0;
+    if (sus < 0.0) sus = 0.0; if (sus > 1.0) sus = 1.0;
+    if (bdb < -24.0) bdb = -24.0; if (bdb > 24.0) bdb = 24.0;
+    if (mdb < -24.0) mdb = -24.0; if (mdb > 24.0) mdb = 24.0;
+    if (tdb < -24.0) tdb = -24.0; if (tdb > 24.0) tdb = 24.0;
+    if (dly < 0.0) dly = 0.0; if (dly > 2000.0) dly = 2000.0;
+    if (dfb < 0.0) dfb = 0.0; if (dfb > 0.95) dfb = 0.95;
+    if (dmx < 0.0) dmx = 0.0; if (dmx > 1.0) dmx = 1.0;
+    if (rrm < 0.0) rrm = 0.0; if (rrm > 0.95) rrm = 0.95;
+    if (rmx < 0.0) rmx = 0.0; if (rmx > 1.0) rmx = 1.0;
+
+    const int rate = 22050;
+    int n = (int)((long long)rate * m / 1000);
+    if (n < 1) n = 1;
+    short* pcm = (short*)malloc(sizeof(short) * (size_t)n);
+    if (!pcm) return XT_FROM_INT(0);
+    double w[4];
+    for (int k = 0; k < 4; k++)
+        w[k] = 2.0 * 3.14159265358979323846 * f * rr[k] / (double)rate;
+
+    // 包络样本数(起音/衰减/释音),延持段为两者之间
+    int a_n = (int)(rate * atk / 1000.0);
+    int d_n = (int)(rate * dec / 1000.0);
+    int r_n = (int)(rate * rel / 1000.0);
+    if (a_n > n / 2) a_n = n / 2;
+    if (d_n > n - a_n - r_n) d_n = (n - a_n - r_n > 0) ? (n - a_n - r_n) : 0;
+    if (r_n > n - a_n - d_n) r_n = (n - a_n - d_n > 0) ? (n - a_n - d_n) : 0;
+    // 包络缺省退化:全 0 → 原 10ms 淡入淡出
+    if (a_n == 0 && d_n == 0 && r_n == 0 && sus >= 1.0) {
+        int fade = rate / 100;
+        if (fade > n / 2) fade = n / 2;
+        a_n = fade; r_n = fade;
+    }
+
+    // EQ 三带
+    XtPeak eqL, eqM, eqT;
+    xt_peak_init(&eqL, 200.0, 0.7, bdb, (double)rate);
+    xt_peak_init(&eqM, 1000.0, 0.7, mdb, (double)rate);
+    xt_peak_init(&eqT, 5000.0, 0.7, tdb, (double)rate);
+
+    // 延迟/混响(0 值即关闭)
+    XtDelay dline;   XtDelay* dp = NULL;
+    XtFdnLine fl[16]; int ccount = 0;   // FDN 8 线(issue #94 混响升级,无 comb 金属共振)
+    double fg = 0.28 + rrm * 0.7; if (fg > 0.95) fg = 0.95;   // FDN 反馈增益
+    double tail_lp = 0.0;   // 尾音一阶低通状态:压共振金属感
+    XtAllpass ap[16]; int acount = 0;
+    if (dly > 0.0) {
+        int dn = (int)(rate * dly / 1000.0);
+        if (dn < 1) dn = 1;
+        xt_delay_init(&dline, dn); dp = &dline;
+    }
+    if (rrm > 0.0) {
+        static const int fdn_t[16] = { 349, 367, 389, 409, 431, 457, 479, 499, 521, 547, 571, 599, 619, 647, 683, 733 };  // 16 质数线 15.8-33.2ms,房间空间更大
+        static const int ap_t[16]   = { 278, 221, 171, 113, 65, 41, 31, 23, 17, 13, 11, 7, 5, 3, 2, 1 };  // 16 级深度扩散
+        for (int i = 0; i < 16; i++) { xt_fdn_init(&fl[i], fdn_t[i]); ccount++; }
+        for (int i = 0; i < 16; i++) { xt_allpass_init(&ap[i], ap_t[i]); acount++; }
+    }
+
+    for (int i = 0; i < n; i++) {
+        // 1) 多振荡器混合(各自 频率比 × 基频,加权累加)
+        double s = 0.0;
+        for (int k = 0; k < cnt; k++) s += vv[k] * xt_osc_sample(wv[k], w[k] * (double)i, w[k] / (2.0 * 3.14159265358979323846));
+        // 2) ADSR 包络(音量已并入各振荡器权重)
+        double env;
+        if (i < a_n) env = (double)i / (double)a_n;
+        else if (i < a_n + d_n) env = 1.0 - (1.0 - sus) * ((double)(i - a_n) / (double)d_n);
+        else if (i >= n - r_n) env = sus * (double)(n - 1 - i) / (double)r_n;
+        else env = sus;
+        s *= env;
+        // 3) EQ 三带
+        s = xt_peak_run(&eqL, s);
+        s = xt_peak_run(&eqM, s);
+        s = xt_peak_run(&eqT, s);
+        // 4) 延迟(输入 = 原声 + 反馈回声)
+        if (dp) {
+            double e = xt_delay_run(dp, s + (dp->idx < dp->size ? dp->buf[dp->idx] : 0.0) * dfb);
+            s = s * (1.0 - dmx) + e * dmx;
+        }
+        // 5) 混响(4 comb + 2 allpass,湿干混合)
+        if (ccount > 0) {
+            double wet = 0.0;
+            double fouts[16];
+            xt_fdn_step(fouts, fl, s, fg);
+            for (int k = 0; k < 16; k++) wet += fouts[k];
+            wet /= 16.0;
+            wet *= 3.0;   // 湿音输出侧增益补偿(全通修复后无放大,可安全提响)
+            for (int k = 0; k < acount; k++) wet = xt_allpass_run(&ap[k], wet);
+            tail_lp = wet * 0.47 + tail_lp * 0.53;
+            wet = tail_lp;
+            if (i < 882) wet *= (double)i / 882.0;   // 湿音 40ms 渐入,消除起始瞬态敲击(水滴铁板)
+            s = s * (1.0 - rmx * 0.5) + wet * (rmx * 0.5);   // 干音期湿音压 50%:水滴可控且混响有参与感;尾音期全开
+        }
+        // 6) 软限幅防爆音
+        s = tanh(s);
+        pcm[i] = (short)(s * 32767.0);
+    }
+    // 效果尾音:音符结束后延迟/混响继续输出(留白回声),避免尾音被音效长度硬切
+    if (dp || ccount > 0) {
+        int tail = 0;
+        if (dp) { int td = (int)(rate * dly / 1000.0) * 5; if (td > tail) tail = td; }
+        if (ccount > 0) {
+                // 动态尾长:高反馈房间衰减慢,尾长按最长 comb 衰减到 -66dB 计算,避免尾音硬截止
+                double fbmax = 0.28 + rrm * 0.7; if (fbmax > 0.95) fbmax = 0.95;
+                int tr = (int)(rate * 2.0);
+                if (fbmax > 0.90) {
+                    double period = 733.0 / rate;   // 最长 FDN 线(与 fdn_t[15] 同步)
+                    double ncyc = log(0.0005) / log(fbmax);
+                    int need = (int)(period * ncyc * rate);
+                    if (need > tr) tr = need;
+                }
+                if (tr > tail) tail = tr;
+            }
+        if (tail > 0) {
+            int total = n + tail;
+            short* npcm = (short*)realloc(pcm, sizeof(short) * (size_t)total);
+            if (npcm) {
+                pcm = npcm;
+                for (int j = n; j < total; j++) {
+                    double s = 0.0;   // 音符已结束,只输出效果尾音
+                    if (dp) {
+                        double e = xt_delay_run(dp, s + (dp->idx < dp->size ? dp->buf[dp->idx] : 0.0) * dfb);
+                        s = s * (1.0 - dmx) + e * dmx;
+                    }
+                    if (ccount > 0) {
+                        double wet = 0.0;
+                        double fouts[16];
+                        xt_fdn_step(fouts, fl, s, fg);
+                        wet = 0.0;
+                        for (int k = 0; k < 16; k++) wet += fouts[k];
+                        wet /= 16.0;
+                        wet *= 10.0;   // 尾音期湿音放大:尾音是混响主体(干音期保持 3.0)
+                        for (int k = 0; k < acount; k++) wet = xt_allpass_run(&ap[k], wet);
+                        s = s * (1.0 - rmx) + wet * rmx;
+                    }
+                    if (ccount > 0) {
+                        tail_lp = s * 0.47 + tail_lp * 0.53;   // ~2.2kHz 一阶低通,压尾音金属共振(钢板模态在中低频)
+                        s = tail_lp;
+                        int fade_n = (int)(rate * 0.3);
+                        if (fade_n > 0 && (total - j) < fade_n) s = s * ((double)(total - j) / fade_n);
+                    }
+                    s = tanh(s);
+                    pcm[j] = (short)(s * 32767.0);
+                }
+                n = total;
+            }
+        }
+    }
+    // 调试导出:环境变量 XT_WAVE_DUMP 存在时写 raw PCM(16bit mono),用于尾音时域分析
+    if (getenv("XT_WAVE_DUMP")) {
+        FILE* fd = fopen(getenv("XT_WAVE_DUMP"), "wb");
+        if (fd) { fwrite(pcm, sizeof(short), (size_t)n, fd); fclose(fd); }
+    }
+    // 释放效果器缓冲
+    if (dp) { free(dp->buf); }
+    for (int k = 0; k < ccount; k++) { free(fl[k].buf); free(fl[k].ap.buf); }
+    for (int k = 0; k < acount; k++) free(ap[k].buf);
+
+    Wave wv2;
+    wv2.frameCount = (unsigned int)n;
+    wv2.sampleRate = (unsigned int)rate;
+    wv2.sampleSize = 16;
+    wv2.channels = 1;
+    wv2.data = pcm;
+    Sound s2 = LoadSoundFromWave(wv2);
+    if (s2.stream.buffer == NULL || s2.frameCount == 0) {
+        free(pcm);
+        return XT_FROM_INT(0);
+    }
+    xt_snd_pool[slot] = s2;
+    xt_synth_pcm[slot] = pcm;                    // 保活;XT_UnloadSound 释放
+    xt_snd_used[slot] = 1;
+    return XT_FROM_INT(slot + 1);
+}
 uintptr_t XT_LoadMusicStream(uintptr_t filename) {
+    int slot = xt_mus_alloc();
+    if (slot < 0) return XT_FROM_INT(0);
     Music m = LoadMusicStream(xt_get_cstr(filename));
-    Music* p = (Music*)calloc(1, sizeof(Music));
-    *p = m;
-    return (uintptr_t)p;
+    if (m.stream.buffer == NULL || m.frameCount == 0) return XT_FROM_INT(0);
+    xt_mus_pool[slot] = m;
+    xt_mus_used[slot] = 1;
+    return XT_FROM_INT(slot + 1);
 }
 
-void XT_PlayMusicStream(uintptr_t musicPtr) {
-    if (IS_PTR(musicPtr) && musicPtr != 0) {
-        PlayMusicStream(*(Music*)musicPtr);
-    }
+void XT_PlayMusicStream(uintptr_t mus) {
+    if (!IsAudioDeviceReady()) { xt_audio_hint(); return; }
+    Music* p = xt_get_mus(mus);
+    if (p) PlayMusicStream(*p);
 }
 
-void XT_UpdateMusicStream(uintptr_t musicPtr) {
-    if (IS_PTR(musicPtr) && musicPtr != 0) {
-        UpdateMusicStream(*(Music*)musicPtr);
-    }
+void XT_UpdateMusicStream(uintptr_t mus) {
+    Music* p = xt_get_mus(mus);
+    if (p) UpdateMusicStream(*p);
 }
 
-void XT_StopMusicStream(uintptr_t musicPtr) {
-    if (IS_PTR(musicPtr) && musicPtr != 0) {
-        StopMusicStream(*(Music*)musicPtr);
-    }
+void XT_StopMusicStream(uintptr_t mus) {
+    Music* p = xt_get_mus(mus);
+    if (p) StopMusicStream(*p);
 }
 
-void XT_UnloadMusicStream(uintptr_t musicPtr) {
-    if (IS_PTR(musicPtr) && musicPtr != 0) {
-        UnloadMusicStream(*(Music*)musicPtr);
-        free((void*)musicPtr);
-    }
+void XT_UnloadMusicStream(uintptr_t mus) {
+    Music* p = xt_get_mus(mus);
+    if (!p) return;
+    UnloadMusicStream(*p);
+    xt_mus_used[XT_TO_INT(mus) - 1] = 0;
 }
 
 // ============================================================
@@ -1010,6 +2074,91 @@ static Font* xt_get_font(uintptr_t fontVal) {
     int64_t idx = XT_TO_INT(fontVal);
     if (idx < 1 || idx > xt_font_count) return NULL;
     return &xt_font_pool[idx - 1];
+}
+
+// TTC 容器取首 face 偏移（ttcf 头 + 大端表偏移表）。stb_truetype 本身支持 TTC
+// （stbtt_GetFontOffsetForIndex），但 raylib 硬编码 stbtt_InitFont(..., 0)（rtext.c），
+// 不识别 ttcf 容器 → 任何 TTC 直载都失败并静默回退默认字体（issue #43 实测）。
+// 非 ttc 返回 0（原样加载）。
+static unsigned int xt_ttc_first_face_offset(const unsigned char* data, size_t size) {
+    if (size < 16 || memcmp(data, "ttcf", 4) != 0) return 0;
+    unsigned int numFonts = ((unsigned int)data[8] << 24) | ((unsigned int)data[9] << 16) |
+                            ((unsigned int)data[10] << 8) | (unsigned int)data[11];
+    if (numFonts < 1) return 0;
+    return ((unsigned int)data[12] << 24) | ((unsigned int)data[13] << 16) |
+           ((unsigned int)data[14] << 8) | (unsigned int)data[15];
+}
+
+/* TTC 的表记录 offset 以「文件头」为基准（OpenType 规范；Windows 14 款自带 TTC 与 Apple 实测一致），
+   而 raylib 按 offset 0 直读（见上），故必须重组。方案:把首 face 重新组装为独立 ttf
+   (表记录 offset 改写为相对新文件头),再由 raylib 加载。
+   所有边界比较用 size_t——字段取自文件内容,畸形值在原 32 位算式下回绕可越界读(实测段错误)。
+   返回 malloc 缓冲(调用方 free),失败返回 NULL。 */
+static unsigned char* xt_ttc_rebuild_face(const unsigned char* data, int size,
+                                          unsigned int faceOff, int* outSize) {
+    if (size < 12 || (size_t)faceOff + 12 > (size_t)size) return NULL;
+    const unsigned char* face = data + faceOff;
+    unsigned int numTables = ((unsigned int)face[4] << 8) | (unsigned int)face[5];
+    if (numTables == 0 || numTables > 64) return NULL;
+    /* 表 offset 基准:规范为「文件头」基准(Windows/Apple 实测一致)。探测仍双基准尝试兜底:
+       用 head 表 magic(0x5F0F3CF5)+unitsPerEm 判断,命中 magic 的为正确基准;都不命中按规范取文件基准。 */
+    int baseIsFile = 1;
+    unsigned int headOff = 0;
+    for (unsigned int i = 0; i < numTables; i++) {
+        if (memcmp(face + 12 + 16 * i, "head", 4) == 0) {
+            headOff = ((unsigned int)face[12+16*i+8] << 24) | ((unsigned int)face[12+16*i+9] << 16) |
+                      ((unsigned int)face[12+16*i+10] << 8) | (unsigned int)face[12+16*i+11];
+            break;
+        }
+    }
+    if (headOff) {
+        if ((size_t)headOff + 32 <= (size_t)size) {
+            const unsigned char* h = data + headOff;
+            unsigned int magic = ((unsigned int)h[12]<<24)|((unsigned int)h[13]<<16)|((unsigned int)h[14]<<8)|(unsigned int)h[15];
+            unsigned int upm = ((unsigned int)h[18]<<8)|(unsigned int)h[19];
+            if (magic == 0x5F0F3CF5u && upm >= 16 && upm <= 16384) baseIsFile = 1;
+        }
+        if (!baseIsFile && (size_t)faceOff + headOff + 32 <= (size_t)size) {
+            const unsigned char* h = data + faceOff + headOff;
+            unsigned int magic = ((unsigned int)h[12]<<24)|((unsigned int)h[13]<<16)|((unsigned int)h[14]<<8)|(unsigned int)h[15];
+            unsigned int upm = ((unsigned int)h[18]<<8)|(unsigned int)h[19];
+            if (magic == 0x5F0F3CF5u && upm >= 16 && upm <= 16384) baseIsFile = 0;
+        }
+        /* 都未命中:保持默认文件基准(规范) */
+    }
+    /* 新布局:12 字节 sfnt 头 + 16*numTables 表记录 + 表数据 */
+    unsigned int dataStart = 12 + 16 * numTables;
+    size_t total = dataStart;
+    /* 先扫表记录:验证表数据在文件内,累计大小 */
+    struct { unsigned int oldOff; unsigned int len; } tabs[64];
+    for (unsigned int i = 0; i < numTables; i++) {
+        const unsigned char* rec = face + 12 + 16 * i;
+        unsigned int coff = ((unsigned int)rec[8] << 24) | ((unsigned int)rec[9] << 16) |
+                            ((unsigned int)rec[10] << 8) | (unsigned int)rec[11];
+        unsigned int clen = ((unsigned int)rec[12] << 24) | ((unsigned int)rec[13] << 16) |
+                            ((unsigned int)rec[14] << 8) | (unsigned int)rec[15];
+        size_t srcOff = baseIsFile ? (size_t)coff : (size_t)faceOff + coff;
+        if (srcOff + clen > (size_t)size) return NULL;
+        tabs[i].oldOff = (unsigned int)srcOff; tabs[i].len = clen;
+        total += clen;
+    }
+    if (total > 0x7FFFFFFFu) return NULL;   /* outSize 为 int;真字体远达不到 */
+    unsigned char* out = (unsigned char*)malloc(total);
+    if (!out) return NULL;
+    memcpy(out, face, 12);   /* sfnt 头(含 numTables/searchRange 等,stb 不依赖 searchRange) */
+    unsigned int pos = dataStart;
+    for (unsigned int i = 0; i < numTables; i++) {
+        const unsigned char* rec = face + 12 + 16 * i;
+        unsigned char* nrec = out + 12 + 16 * i;
+        memcpy(nrec, rec, 8);   /* tag + checksum */
+        nrec[8] = (unsigned char)(pos >> 24); nrec[9] = (unsigned char)(pos >> 16);
+        nrec[10] = (unsigned char)(pos >> 8); nrec[11] = (unsigned char)pos;
+        nrec[12] = rec[12]; nrec[13] = rec[13]; nrec[14] = rec[14]; nrec[15] = rec[15];
+        memcpy(out + pos, data + tabs[i].oldOff, tabs[i].len);
+        pos += tabs[i].len;
+    }
+    *outSize = (int)total;
+    return out;
 }
 
 // 返回整数句柄（1-8），失败返回 0
@@ -1038,10 +2187,32 @@ uintptr_t XT_LoadFont(uintptr_t filename, uintptr_t fontSize) {
     int dataSize = 0;
     unsigned char* data = xt_read_file_bytes(xt_get_cstr(filename), &dataSize);
     if (!data) { free(codepoints); return XT_FROM_INT(0); }
-    Font f = LoadFontFromMemory(".ttf", data, dataSize, (int)XT_TO_INT(fontSize), codepoints, cpCount);
+    /* ttc 容器:首 face 可能是 CFF(OTTO,stb 不支持——返 0 不崩)或 TTC 表基准(相对文件头,
+       需重组为独立 ttf 再加载)——issue #43 实测 */
+    unsigned char* loadData = data;
+    int loadSize = dataSize;
+    unsigned int ttcOff = xt_ttc_first_face_offset(data, (size_t)dataSize);
+    if (ttcOff) {
+        /* 边界用 size_t:ttcOff 取自文件字段,畸形值令 (int)ttcOff+4 变负而绕过校验(实测段错误) */
+        if ((size_t)dataSize >= 4 && ttcOff <= (size_t)dataSize - 4 &&
+            memcmp(data + ttcOff, "OTTO", 4) == 0) {
+            free(data); free(codepoints); return XT_FROM_INT(0);
+        }
+        unsigned char* rebuilt = xt_ttc_rebuild_face(data, dataSize, ttcOff, &loadSize);
+        if (!rebuilt) { free(data); free(codepoints); return XT_FROM_INT(0); }
+        loadData = rebuilt;
+    }
+    Font f = LoadFontFromMemory(".ttf", loadData, loadSize, (int)xt_ni(fontSize), codepoints, cpCount);
+    if (loadData != data) free(loadData);
     free(data);
     free(codepoints);
-    if (f.glyphCount == 0) f = GetFontDefault();
+    /* 真失败检测:glyphCount==0 或纹理即默认字体(加载失败时 raylib 静默回退默认字体,
+       glyphCount=224 非 0,旧检测失效——issue #43 实测伪成功)→ 返回 0,不占槽位 */
+    if (f.glyphCount == 0 || f.texture.id == GetFontDefault().texture.id) return XT_FROM_INT(0);
+
+    /* 字形图集采样必须是双线性(issue #89):raylib 默认最近邻, macOS 无 GDI 光栅化,
+       于是字体边缘全是硬锯齿。Windows 走 GDI 路径时另有设置,这里覆盖 ttf 直载路径。 */
+    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
 
     xt_font_pool[xt_font_count] = f;
     xt_font_count++;
@@ -1081,10 +2252,29 @@ uintptr_t XT_LoadFontEx(uintptr_t filename, uintptr_t fontSize, uintptr_t refTex
     int dataSizeEx = 0;
     unsigned char* dataEx = xt_read_file_bytes(xt_get_cstr(filename), &dataSizeEx);
     if (!dataEx) { free(codepoints); return XT_FROM_INT(0); }
-    Font f = LoadFontFromMemory(".ttf", dataEx, dataSizeEx, (int)XT_TO_INT(fontSize), codepoints, idx);
+    /* ttc 容器:同 XT_LoadFont(CFF 返 0 / TTC 表基准重组)——issue #43 */
+    unsigned char* loadDataEx = dataEx;
+    int loadSizeEx = dataSizeEx;
+    unsigned int ttcOffEx = xt_ttc_first_face_offset(dataEx, (size_t)dataSizeEx);
+    if (ttcOffEx) {
+        /* 边界用 size_t(同 XT_LoadFont:畸形 ttcOff 的 (int) 转换可绕过校验) */
+        if ((size_t)dataSizeEx >= 4 && ttcOffEx <= (size_t)dataSizeEx - 4 &&
+            memcmp(dataEx + ttcOffEx, "OTTO", 4) == 0) {
+            free(dataEx); free(codepoints); return XT_FROM_INT(0);
+        }
+        unsigned char* rebuilt = xt_ttc_rebuild_face(dataEx, dataSizeEx, ttcOffEx, &loadSizeEx);
+        if (!rebuilt) { free(dataEx); free(codepoints); return XT_FROM_INT(0); }
+        loadDataEx = rebuilt;
+    }
+    Font f = LoadFontFromMemory(".ttf", loadDataEx, loadSizeEx, (int)xt_ni(fontSize), codepoints, idx);
+    if (loadDataEx != dataEx) free(loadDataEx);
     free(dataEx);
     free(codepoints);
-    if (f.glyphCount == 0) f = GetFontDefault();
+    /* 真失败检测(同 XT_LoadFont:消除伪成功——issue #43) */
+    if (f.glyphCount == 0 || f.texture.id == GetFontDefault().texture.id) return XT_FROM_INT(0);
+
+    /* 双线性采样(issue #89,与 XT_LoadFont 同口径) */
+    SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
 
     xt_font_pool[xt_font_count] = f;
     xt_font_count++;
@@ -1129,11 +2319,11 @@ void XT_DrawTextEx(uintptr_t fontHandle, uintptr_t text, uintptr_t x, uintptr_t 
 #endif
     Font* p = xt_get_font(fontHandle);
     if (p) {
-        Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-                   (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-        Vector2 pos = {(float)XT_TO_INT(x), (float)XT_TO_INT(y)};
-        DrawTextEx(*p, xt_get_cstr(text), pos, (float)XT_TO_INT(fontSize),
-                   (float)XT_TO_INT(spacing), c);
+        Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+                   (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+        Vector2 pos = {xt_nf(x), xt_nf(y)};
+        DrawTextEx(*p, xt_get_cstr(text), pos, xt_nf(fontSize),
+                   xt_nf(spacing), c);
     }
 }
 
@@ -1150,12 +2340,12 @@ void XT_DrawTextExFP(uintptr_t fontHandle, uintptr_t text, uintptr_t x1000, uint
 #endif
     Font* p = xt_get_font(fontHandle);
     if (p) {
-        Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-                   (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
-        Vector2 pos = {(float)XT_TO_INT(x1000) / 1000.0f, (float)XT_TO_INT(y1000) / 1000.0f};
-        float fsz = (float)XT_TO_INT(fontSize) * ((float)XT_TO_INT(scale1000) / 1000.0f);
+        Color c = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+                   (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
+        Vector2 pos = {xt_nf(x1000) / 1000.0f, xt_nf(y1000) / 1000.0f};
+        float fsz = xt_nf(fontSize) * (xt_nf(scale1000) / 1000.0f);
         DrawTextEx(*p, xt_get_cstr(text), pos, fsz,
-                   (float)XT_TO_INT(spacing), c);
+                   xt_nf(spacing), c);
     }
 }
 
@@ -1168,7 +2358,7 @@ uintptr_t XT_MeasureTextEx(uintptr_t fontHandle, uintptr_t text, uintptr_t fontS
 #endif
     Font* p = xt_get_font(fontHandle);
     if (!p) return XT_FROM_INT(0);
-    Vector2 v = MeasureTextEx(*p, xt_get_cstr(text), (float)XT_TO_INT(fontSize), (float)XT_TO_INT(spacing));
+    Vector2 v = MeasureTextEx(*p, xt_get_cstr(text), xt_nf(fontSize), xt_nf(spacing));
     return XT_FROM_INT((int64_t)(v.x + 0.5));
 }
 
@@ -1356,7 +2546,7 @@ uintptr_t XT_FontGDI_Create(uintptr_t faceVal, uintptr_t sizeVal) {
     f->atlasImg = GenImageColor(XT_GDI_ATLAS, XT_GDI_ATLAS, (Color){0, 0, 0, 0});
     ImageFormat(&f->atlasImg, PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA);
     /* 首字号预热(失败 = 字体名无效,整体失败) */
-    int baseSize = (int)XT_TO_INT(sizeVal);
+    int baseSize = (int)xt_ni(sizeVal);
     if (xt_gdi_size_slot(f, baseSize) < 0 || f->sizeCount == 0) {
         UnloadImage(f->atlasImg);
         free(f->hash);
@@ -1378,9 +2568,9 @@ static void xt_gdi_draw_impl(uintptr_t handle, uintptr_t text, float fx, float f
     if (idx < 0 || idx >= XT_GDI_MAX_FONTS) return;
     XTGdiFont* f = &xt_gdi_fonts[idx];
     if (!f->used) return;
-    int sp = (int)XT_TO_INT(spacing);   // 字距:相邻字符之间(首字符前不加)
+    int sp = (int)xt_ni(spacing);   // 字距:相邻字符之间(首字符前不加)
     const char* s = xt_get_cstr(text);
-    int sizeIdx = xt_gdi_size_slot(f, (int)XT_TO_INT(fontSize));
+    int sizeIdx = xt_gdi_size_slot(f, (int)xt_ni(fontSize));
     /* 第一遍:确保全部码点已栅格化(新字形置 dirty) */
     {
         const char* p = s;
@@ -1402,8 +2592,8 @@ static void xt_gdi_draw_impl(uintptr_t handle, uintptr_t text, float fx, float f
         f->dirty = 0;
     }
     /* 第二遍:绘制(浮点笔位 × 整体缩放,亚像素) */
-    Color tint = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
-                  (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
+    Color tint = {(unsigned char)xt_ni(r), (unsigned char)xt_ni(g),
+                  (unsigned char)xt_ni(b), (unsigned char)xt_ni(a)};
     float penX = fx;
     float baseTop = fy;
     float spf = (float)sp * scale;
@@ -1441,7 +2631,7 @@ static void xt_gdi_draw_impl(uintptr_t handle, uintptr_t text, float fx, float f
 void XT_FontGDI_DrawText(uintptr_t handle, uintptr_t text, uintptr_t x, uintptr_t y,
                          uintptr_t fontSize, uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a,
                          uintptr_t spacing) {
-    xt_gdi_draw_impl(handle, text, (float)XT_TO_INT(x), (float)XT_TO_INT(y), 1.0f, fontSize, r, g, b, a, spacing);
+    xt_gdi_draw_impl(handle, text, xt_nf(x), xt_nf(y), 1.0f, fontSize, r, g, b, a, spacing);
 }
 
 /* 千分定点坐标版(亚像素;微交互动画用;scale1000: 1000=原倍,字形图集 GPU 缩放不重光栅化) */
@@ -1449,8 +2639,8 @@ void XT_FontGDI_DrawTextFP(uintptr_t handle, uintptr_t text, uintptr_t x1000, ui
                            uintptr_t scale1000,
                            uintptr_t fontSize, uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a,
                            uintptr_t spacing) {
-    xt_gdi_draw_impl(handle, text, (float)XT_TO_INT(x1000) / 1000.0f, (float)XT_TO_INT(y1000) / 1000.0f,
-                     (float)XT_TO_INT(scale1000) / 1000.0f, fontSize, r, g, b, a, spacing);
+    xt_gdi_draw_impl(handle, text, xt_nf(x1000) / 1000.0f, xt_nf(y1000) / 1000.0f,
+                     xt_nf(scale1000) / 1000.0f, fontSize, r, g, b, a, spacing);
 }
 
 /* 测量文本宽度(GDI 精确度量,GetTextExtentPoint32W;字距按"每字符一个后置间距槽"计 = spacing×字符数,
@@ -1461,8 +2651,8 @@ uintptr_t XT_FontGDI_Measure(uintptr_t handle, uintptr_t text, uintptr_t fontSiz
     if (idx < 0 || idx >= XT_GDI_MAX_FONTS) return XT_FROM_INT(0);
     XTGdiFont* f = &xt_gdi_fonts[idx];
     if (!f->used) return XT_FROM_INT(0);
-    int sp = (int)XT_TO_INT(spacing);
-    int sizeIdx = xt_gdi_size_slot(f, (int)XT_TO_INT(fontSize));
+    int sp = (int)xt_ni(spacing);
+    int sizeIdx = xt_gdi_size_slot(f, (int)xt_ni(fontSize));
     SelectObject(f->hdc, f->hfonts[sizeIdx]);
     const char* s = xt_get_cstr(text);
     int wlen = MultiByteToWideChar(65001, 0, s, -1, NULL, 0);
@@ -1500,29 +2690,222 @@ void XT_FontGDI_Unload(uintptr_t handle) {
 }
 #endif /* _WIN32 */
 
-#if !defined(_WIN32)
-/* 非 Windows 平台：GDI 系统字体光栅化暂不支持（macOS/Linux 走 raylib 字体路径）。
-   返回 0 = 创建失败；调用方（加载系统字体）拿到 0 后，绘制路径回退 raylib 默认字体/无操作。 */
-uintptr_t XT_FontGDI_Create(uintptr_t faceVal, uintptr_t sizeVal) {
-    (void)faceVal; (void)sizeVal;
+/* 判断某字体句柄是否含指定 Unicode 码点的字形(缺字监测用;1=有,0=无/句柄无效)。
+   两套字体后端都覆盖:
+   - raylib 字体池(1..8):看字形表里有没有该码点(只含烘焙码点,未烘焙=视为缺字);
+   - Windows GDI 字体(100+):GetGlyphIndicesW + GGI_MARK_NONEXISTING_GLYPHS,
+     由系统字体真实 cmap 判定,能识别未烘焙但字体文件里存在的字。 */
+#ifdef _WIN32
+extern __declspec(dllimport) unsigned int WINAPI GetGlyphIndicesW(
+    XT_HDC, const wchar_t*, int, unsigned short*, unsigned int);
+#endif
+uintptr_t XT_FontHasGlyph(uintptr_t fontVal, uintptr_t cpVal) {
+    int cp = (int)xt_ni(cpVal);
+    if (cp <= 0) return XT_FROM_INT(0);
+#ifdef _WIN32
+    int64_t h = XT_TO_INT(fontVal);
+    if (h >= 100) {
+        int idx = (int)(h - 100);
+        if (idx >= 0 && idx < XT_GDI_MAX_FONTS) {
+            XTGdiFont* f = &xt_gdi_fonts[idx];
+            if (f->used) {
+                /* 取一个已建好的字号槽(缺省 32);SelectObject 后才能问 cmap */
+                int si = xt_gdi_size_slot(f, f->sizeCount > 0 ? f->sizes[0] : 32);
+                if (si >= 0 && si < f->sizeCount && f->hfonts[si]) {
+                    SelectObject(f->hdc, f->hfonts[si]);
+                    wchar_t wch = (wchar_t)(cp <= 0xFFFF ? cp : 0xFFFD);
+                    unsigned short gi = 0;
+                    unsigned int r = GetGlyphIndicesW(f->hdc, &wch, 1, &gi, 1u);
+                    if (r != 0xFFFFFFFFu && gi != 0xFFFF) return XT_FROM_INT(1);
+                }
+                return XT_FROM_INT(0);
+            }
+        }
+        return XT_FROM_INT(0);
+    }
+#endif
+    Font* p = xt_get_font(fontVal);
+    if (!p) return XT_FROM_INT(0);
+    for (int i = 0; i < p->glyphCount; i++) {
+        if (p->glyphs[i].value == cp) return XT_FROM_INT(1);
+    }
     return XT_FROM_INT(0);
+}
+
+/* UTF-8 字符串按「字符下标」取 Unicode 码点(缺字监测逐字检查用;下标越界返 0)。
+   下标是字符序(跳过 UTF-8 续字节),与 玄铁 字符串.截取 的字符索引一致。 */
+uintptr_t XT_CharCodepoint(uintptr_t textVal, uintptr_t idxVal) {
+    if (!IS_PTR(textVal)) return XT_FROM_INT(0);
+    const unsigned char* s = (const unsigned char*)xt_get_cstr(textVal);
+    int want = (int)xt_ni(idxVal);
+    int ci = 0;
+    while (*s) {
+        unsigned cp = 0;
+        int len = 1;
+        if (*s < 0x80) { cp = *s; len = 1; }
+        else if ((*s & 0xE0) == 0xC0) { cp = ((unsigned)(*s & 0x1F) << 6) | (unsigned)(s[1] & 0x3F); len = 2; }
+        else if ((*s & 0xF0) == 0xE0) { cp = ((unsigned)(*s & 0x0F) << 12) | ((unsigned)(s[1] & 0x3F) << 6) | (unsigned)(s[2] & 0x3F); len = 3; }
+        else { cp = ((unsigned)(*s & 0x07) << 18) | ((unsigned)(s[1] & 0x3F) << 12) | ((unsigned)(s[2] & 0x3F) << 6) | (unsigned)(s[3] & 0x3F); len = 4; }
+        if (ci == want) return XT_FROM_INT((int64_t)cp);
+        s += len;
+        ci++;
+    }
+    return XT_FROM_INT(0);
+}
+
+/* ── 系统字体名 → 字体文件路径(POSIX 用;issue #43)─────────────────────────────
+   Windows 的系统字体走 GDI 光栅化,不需要文件;macOS/Linux 没有 GDI,只能由 raylib 从
+   ttf/ttc 载入 —— 本条把「系统字体名」映射到实际文件,让 加载系统字体 在两平台对等。
+   规则:①名字里带路径分隔符或字体扩展名 → 当路径直用;②按名字查表(包含匹配,允许
+   "PingFang SC" 这类写法);③都没命中 → 按表内顺序取第一个存在的系统 CJK 字体兜底
+   (与 Windows 的字体回落同义);④一个都不存在 → 返回 0,调用方回退 raylib 默认字体,
+   不静默假装成功。
+   说明:本函数刻意放在平台宏之外 —— 表内路径由 #if 分区,函数体本身是共享代码,
+   于是它在 Windows 构建里也会被编译,新代码的语法错误当场暴露(不必等 macOS 才知道)。 */
+#if defined(__APPLE__)
+/* 运行时 glob 取第一个命中路径(AssetsV2 字体 asset 目录 hash 随系统版本变化,不可写死) */
+static int xt_font_glob_first(const char* pattern, char* out, size_t outsz) {
+    glob_t g;
+    if (glob(pattern, 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+        snprintf(out, outsz, "%s", g.gl_pathv[0]);
+        globfree(&g);
+        return 1;
+    }
+    globfree(&g);
+    return 0;
 }
 #endif
 
-/* 截图导出 PNG(当前帧缓冲;渲染调试/自动化验收用——须在 结束绘图 之后调用) */
-void XT_SaveScreenshot(uintptr_t pathVal) {
-    if (!IS_PTR(pathVal)) return;
-    // 不用 raylib TakeScreenshot:它会把 "G:/..." 正斜杠绝对路径也拼上工作目录。
-    // ExportImage 底层 fopen:相对路径天然按 CWD 解析,绝对路径原样使用。
-    Image img = LoadImageFromScreen();
-    if (!img.data) return;
-    ExportImage(img, xt_get_cstr(pathVal));
-    UnloadImage(img);
+/* 字体文件是否可被 raylib 加载:stb_truetype 不支持 CID-keyed CFF(Apple 苹方/冬青黑体等
+   OTTO 首 face 的 ttc 加载即断言崩溃——issue #43 macOS 实测);ttc 容器解析首 face magic
+   判断,glyf/TrueType 可用。非 ttc/单文件不做拦阻(单 .otf name-keyed CFF stb 可处理)。 */
+static int xt_font_path_usable(const char* path) {
+    FILE* fp = fopen(path, "rb");
+    if (!fp) return 0;
+    unsigned char h[16];
+    size_t n = fread(h, 1, 16, fp);
+    if (n >= 16 && memcmp(h, "ttcf", 4) == 0) {
+        unsigned int off = ((unsigned int)h[12] << 24) | ((unsigned int)h[13] << 16) |
+                           ((unsigned int)h[14] << 8) | (unsigned int)h[15];
+        if (fseek(fp, (long)off, SEEK_SET) == 0) {
+            unsigned char m[4];
+            if (fread(m, 1, 4, fp) == 4 && memcmp(m, "OTTO", 4) == 0) { fclose(fp); return 0; }
+        }
+    }
+    fclose(fp);
+    return 1;
+}
+static int xt_font_resolve_path(const char* name, char* out, size_t outsz) {
+    static const struct { const char* key; const char* path; } cand[] = {
+#if defined(__APPLE__)
+        {"苹方",     "/System/Library/Fonts/PingFang.ttc"},
+        {"PingFang", "/System/Library/Fonts/PingFang.ttc"},
+        {"pingfang", "/System/Library/Fonts/PingFang.ttc"},
+        {"黑体",     "/System/Library/Fonts/STHeiti Light.ttc"},
+        {"Heiti",    "/System/Library/Fonts/STHeiti Light.ttc"},
+        {"冬青黑体",  "/System/Library/Fonts/Hiragino Sans GB.ttc"},
+        {"Hiragino", "/System/Library/Fonts/Hiragino Sans GB.ttc"},
+        {"宋体",     "/System/Library/Fonts/Supplemental/Songti.ttc"},
+        {"Songti",   "/System/Library/Fonts/Supplemental/Songti.ttc"},
+        {"楷体",     "/System/Library/Fonts/Kaiti.ttc"},
+        {"Kaiti",    "/System/Library/Fonts/Kaiti.ttc"},
+#elif defined(__linux__)
+        {"文泉驿",   "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"},
+        {"wqy",      "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"},
+        {"Noto",     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"},
+        {"noto",     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"},
+        {"思源",     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"},
+        {"黑体",     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"},
+#endif
+        {NULL, NULL}
+    };
+    if (!name || !name[0]) name = "苹方";
+    /* ① 名字本身就是路径 */
+    if (strchr(name, '/') || strchr(name, '\\') ||
+        strstr(name, ".ttf") || strstr(name, ".ttc") || strstr(name, ".otf") ||
+        strstr(name, ".TTF") || strstr(name, ".TTC") || strstr(name, ".OTF")) {
+        if (!xt_font_path_usable(name)) return 0;
+        snprintf(out, outsz, "%s", name);
+        return 1;
+    }
+    /* ② 按名字查表 */
+    for (int i = 0; cand[i].key; i++) {
+        if (strstr(name, cand[i].key)) {
+            if (xt_font_path_usable(cand[i].path)) { snprintf(out, outsz, "%s", cand[i].path); return 1; }
+#if defined(__APPLE__)
+            /* 苹方在 /System/Library/Fonts 下无固定路径(实际在 AssetsV2 动态 asset 目录,
+               目录 hash 随系统版本变化——issue #43 实测):表路径不在时运行时 glob 探测 */
+            if (strstr(cand[i].path, "PingFang.ttc")) {
+                if (xt_font_glob_first(
+                        "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/*/AssetData/PingFang.ttc",
+                        out, outsz) && xt_font_path_usable(out)) return 1;
+                /* 命中但 CFF(OTTO,stb 不支持加载)→ 不返回,落 ③ 兜底到黑体 */
+            }
+#endif
+        }
+    }
+    /* ③ 名字没命中(或命中但文件不可用):按顺序回退表内第一个可用的系统 CJK 字体 */
+    for (int i = 0; cand[i].key; i++) {
+        if (xt_font_path_usable(cand[i].path)) { snprintf(out, outsz, "%s", cand[i].path); return 1; }
+    }
+    return 0;
+}
+
+/* POSIX 版「系统字体名 → 字体句柄」的实现体。刻意放在平台宏之外(与解析函数同理):
+   它只用到 XT_LoadFont/xt_string_new/xt_release 这些共享 API,于是 Windows 构建也会编译它,
+   语法错误当场暴露;Windows 上它不参与链接(GDI 版另有实现),故加 unused 抑制告警。 */
+__attribute__((unused))
+static uintptr_t xt_font_create_from_name(uintptr_t faceVal, uintptr_t sizeVal) {
+    if (!IS_PTR(faceVal)) return XT_FROM_INT(0);
+    char path[512];
+    if (!xt_font_resolve_path(xt_get_cstr(faceVal), path, sizeof(path))) return XT_FROM_INT(0);
+    uintptr_t pathStr = (uintptr_t)xt_string_new(path);   /* XT_LoadFont 只读,不接管所有权 */
+    if (!IS_PTR(pathStr)) return XT_FROM_INT(0);
+    uintptr_t h = XT_LoadFont(pathStr, sizeVal);
+    xt_release(pathStr);
+    return h;
+}
+
+#if !defined(_WIN32)
+/* 非 Windows 平台:无 GDI,改为「系统字体名 → ttf/ttc 路径 → raylib 载入」,与 Windows 对等(issue #43)。
+   载入走既有的 XT_LoadFont(同一套 CJK 码点集),因此句柄语义、绘制、释放路径完全一致。
+   取不到字体文件时返回 0 = 创建失败,调用方(加载系统字体)拿到 0 后回退 raylib 默认字体/无操作。 */
+uintptr_t XT_FontGDI_Create(uintptr_t faceVal, uintptr_t sizeVal) {
+    return xt_font_create_from_name(faceVal, sizeVal);
+}
+#endif
+
+/* 截图导出 PNG(渲染调试/自动化验收用)。issue #92 改为「请求式」:
+   本函数只登记路径,真正的抓帧由 XT_EndDrawing 在 SwapScreenBuffer 之前完成——
+   调用方写在 开始绘图/结束绘图 之间或之后都不会再拿到交换后的空帧(macOS 实测全黑)。
+   同一帧内多次调用只有最后一次生效(路径被覆盖,旧路径释放)。
+   帧外调用会在 stderr 打出详细错误(不静默跳过),但仍登记给下一帧,方便动画循环里写在帧末的写法。
+   返回 1=已登记,0=路径非法。 */
+uintptr_t XT_SaveScreenshot(uintptr_t pathVal) {
+    if (!IS_PTR(pathVal)) return XT_FROM_INT(0);
+    const char* p = xt_get_cstr(pathVal);
+    if (!p || !*p) {
+        fprintf(stderr, "[渲染库][错误] 截图:路径为空,未登记\n");
+        return XT_FROM_INT(0);
+    }
+    if (!xt_in_draw_frame) {
+        fprintf(stderr,
+                "[渲染库][错误] 截图 调用时机不对:%s\n"
+                "  截图 必须在 `开始绘图` 与 `结束绘图` 之间调用;当前不在绘制帧内。\n"
+                "  已登记给下一帧:若程序只有这一帧就结束(不再调用 结束绘图),不会有文件产出。\n",
+                p);
+    }
+    free(xt_shot_pending);
+    size_t len = strlen(p);
+    xt_shot_pending = (char*)malloc(len + 1);
+    if (!xt_shot_pending) return XT_FROM_INT(0);
+    memcpy(xt_shot_pending, p, len + 1);
+    return XT_FROM_INT(1);
 }
 
 /* 裁剪(UI 输入栏等需限制绘制区域的控件用):raylib BeginScissorMode/EndScissorMode 桥接 */
 void XT_BeginScissor(uintptr_t x, uintptr_t y, uintptr_t w, uintptr_t h) {
-    BeginScissorMode((int)XT_TO_INT(x), (int)XT_TO_INT(y), (int)XT_TO_INT(w), (int)XT_TO_INT(h));
+    BeginScissorMode((int)xt_ni(x), (int)xt_ni(y), (int)xt_ni(w), (int)xt_ni(h));
 }
 void XT_EndScissor(void) {
     EndScissorMode();
@@ -1563,8 +2946,8 @@ void XT_SetIMEPos(uintptr_t x, uintptr_t y) {
     XT_COMPFORM cf;
     memset(&cf, 0, sizeof(cf));
     cf.dwStyle = 0x0022;
-    cf.pt.x = (long)XT_TO_INT(x);
-    cf.pt.y = (long)XT_TO_INT(y);
+    cf.pt.x = (long)xt_ni(x);
+    cf.pt.y = (long)xt_ni(y);
     ImmSetCompositionWindow(himc, &cf);
     ImmReleaseContext(hwnd, himc);
 }
@@ -1673,3 +3056,105 @@ uintptr_t XT_IME_GetComp(void) { return (uintptr_t)xt_string_new(""); }
 uintptr_t XT_IME_Enable(uintptr_t on) { (void)on; return XT_FROM_INT(0); }
 void XT_SetIMEPos(uintptr_t x, uintptr_t y) { (void)x; (void)y; }
 #endif
+
+// ============================================================
+// 3D 渲染(v1.3.0,raylib 核心 3D 通道)
+// 坐标约定与 raylib 一致:Y 轴向上、右手系;相机 up 固定 (0,1,0),投影固定透视。
+// 数值参数经 xt_get_float:小数对象取其值;标记整数亦按数值返回——该容错已并入
+//   xt_get_float 公共实现(2026-10-04 统一),整数与小数写法此后全库通吃。
+// rlgl 矩阵栈:本地随附 raylib.h 未包含 rlgl.h,故显式声明原型;符号已在随包
+//   libraylib.a 中(llvm-nm 实测:rlPushMatrix/rlPopMatrix/rlTranslatef/rlRotatef)。
+// ============================================================
+
+RLAPI void rlPushMatrix(void);
+RLAPI void rlPopMatrix(void);
+RLAPI void rlTranslatef(float x, float y, float z);
+RLAPI void rlRotatef(float angle, float x, float y, float z);
+
+static Color xt_color4(uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
+    Color c = {
+        (unsigned char)xt_ni(r),
+        (unsigned char)xt_ni(g),
+        (unsigned char)xt_ni(b),
+        (unsigned char)xt_ni(a)
+    };
+    return c;
+}
+
+static Camera3D g_xt_cam3d = {
+    { 0.0f, 10.0f, -10.0f },
+    { 0.0f, 0.0f, 0.0f },
+    { 0.0f, 1.0f, 0.0f },
+    60.0f,
+    CAMERA_PERSPECTIVE
+};
+
+// 设置 3D 相机(每帧可调,做跟随用);up=(0,1,0),透视投影
+void XT_Camera3D_Set(uintptr_t px, uintptr_t py, uintptr_t pz,
+                     uintptr_t tx, uintptr_t ty, uintptr_t tz, uintptr_t fovy) {
+    g_xt_cam3d.position = (Vector3){ (float)xt_get_float(px), (float)xt_get_float(py), (float)xt_get_float(pz) };
+    g_xt_cam3d.target   = (Vector3){ (float)xt_get_float(tx), (float)xt_get_float(ty), (float)xt_get_float(tz) };
+    g_xt_cam3d.up       = (Vector3){ 0.0f, 1.0f, 0.0f };
+    g_xt_cam3d.fovy     = (float)xt_get_float(fovy);
+    g_xt_cam3d.projection = CAMERA_PERSPECTIVE;
+}
+
+void XT_BeginMode3D(void) { BeginMode3D(g_xt_cam3d); }
+void XT_EndMode3D(void)   { EndMode3D(); }
+
+// 立方体以中心为基准(raylib 语义)
+void XT_DrawCube3D(uintptr_t x, uintptr_t y, uintptr_t z,
+                   uintptr_t w, uintptr_t h, uintptr_t d,
+                   uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
+    DrawCube((Vector3){ (float)xt_get_float(x), (float)xt_get_float(y), (float)xt_get_float(z) },
+             (float)xt_get_float(w), (float)xt_get_float(h), (float)xt_get_float(d),
+             xt_color4(r, g, b, a));
+}
+
+void XT_DrawCubeWires3D(uintptr_t x, uintptr_t y, uintptr_t z,
+                        uintptr_t w, uintptr_t h, uintptr_t d,
+                        uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
+    DrawCubeWires((Vector3){ (float)xt_get_float(x), (float)xt_get_float(y), (float)xt_get_float(z) },
+                  (float)xt_get_float(w), (float)xt_get_float(h), (float)xt_get_float(d),
+                  xt_color4(r, g, b, a));
+}
+
+void XT_DrawSphere3D(uintptr_t x, uintptr_t y, uintptr_t z, uintptr_t radius,
+                     uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
+    DrawSphere((Vector3){ (float)xt_get_float(x), (float)xt_get_float(y), (float)xt_get_float(z) },
+               (float)xt_get_float(radius), xt_color4(r, g, b, a));
+}
+
+void XT_DrawSphereWires3D(uintptr_t x, uintptr_t y, uintptr_t z, uintptr_t radius,
+                          uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
+    DrawSphereWires((Vector3){ (float)xt_get_float(x), (float)xt_get_float(y), (float)xt_get_float(z) },
+                    (float)xt_get_float(radius), 8, 16, xt_color4(r, g, b, a));
+}
+
+void XT_DrawGrid3D(uintptr_t slices, uintptr_t spacing) {
+    DrawGrid((int)xt_ni(slices), (float)xt_get_float(spacing));
+}
+
+void XT_DrawLine3D(uintptr_t x1, uintptr_t y1, uintptr_t z1,
+                   uintptr_t x2, uintptr_t y2, uintptr_t z2,
+                   uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
+    DrawLine3D((Vector3){ (float)xt_get_float(x1), (float)xt_get_float(y1), (float)xt_get_float(z1) },
+               (Vector3){ (float)xt_get_float(x2), (float)xt_get_float(y2), (float)xt_get_float(z2) },
+               xt_color4(r, g, b, a));
+}
+
+void XT_DrawPoint3D(uintptr_t x, uintptr_t y, uintptr_t z,
+                    uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
+    DrawPoint3D((Vector3){ (float)xt_get_float(x), (float)xt_get_float(y), (float)xt_get_float(z) },
+                xt_color4(r, g, b, a));
+}
+
+// 矩阵栈:须在 BeginMode3D 内成对使用(推→平移→旋转→绘制→弹)
+void XT_PushMatrix3D(void) { rlPushMatrix(); }
+void XT_PopMatrix3D(void)  { rlPopMatrix(); }
+void XT_Translate3D(uintptr_t x, uintptr_t y, uintptr_t z) {
+    rlTranslatef((float)xt_get_float(x), (float)xt_get_float(y), (float)xt_get_float(z));
+}
+void XT_Rotate3D(uintptr_t angle, uintptr_t ax, uintptr_t ay, uintptr_t az) {
+    rlRotatef((float)xt_get_float(angle), (float)xt_get_float(ax), (float)xt_get_float(ay), (float)xt_get_float(az));
+}

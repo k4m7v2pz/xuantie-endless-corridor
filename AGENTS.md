@@ -85,6 +85,8 @@ rvs scripts/test-macos.rvs      # 构建 + 短时运行验证（4 秒自动关�
 - `scripts/test-macos.rvs` — macOS 构建 + 短时运行验证
 - `scripts/xtc-抓IR.sh` — xtc 链接失败时轮询截获 LLVM IR 的 helper
 - `scripts/bash/run-check.sh` — 短时运行验证 helper（SIGKILL 清理）
-- `patches/渲染桥.c.macos` — 渲染库 macOS 桥接补丁（复制自 xuantie-life-game）
+- `patches/渲染桥.c.macos` — 渲染库 macOS 桥接，**同步自工具链内置**
+  `~/.caches/xtl/.../xtc-package/lib/渲染/渲染桥.c`：上游已把 macOS 适配并入内置桥，
+  旧版补丁（复制自 xuantie-life-game）缺 `XT_Translate3D` / `合成器` 等符号会链接失败
 - `tiepm_modules/渲染/` — 渲染库依赖（已打补丁；gitignore）
 - `.tiepm/` — 布局桥接符号链接（gitignore，clone 后由构建脚本重建）
