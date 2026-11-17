@@ -61,7 +61,14 @@ bash scripts/关闭.sh            # 关掉本项目所有残留窗口
 6. **裸名撞渲染库导出**：`xtc` 会报 `W007 命名空间撞名（裸名绑定）`，
    但只是警告、照样出产物，运行时静默走错分支或崩。实测变量名 `暂停` 与渲染库
    `公 函 暂停(秒数)` 撞名，改名 `暂停中` 才干净。**起名先 grep 渲染库导出名**。
-7. 本机工具链路径（实测可用）：
+8. **字体图集按「最大绘制字号 × 屏幕像素比」光栅化**（macOS Retina 实测）：
+   渲染桥已设 `FLAG_WINDOW_HIGHDPI`，2x 屏上 40 号字实际占 80 物理像素；
+   若图集仍按 24 或 40 光栅化，标题放大会糊（肉眼看就是"低分辨率/像素感"）。
+   `渲染.xt` 没导出缩放系数，但桥里有 `XT_GetRenderWidth`——项目里自己声明
+   `外 函 XT_GetRenderWidth(): 整`，用 `XT_GetRenderWidth() / R.取屏幕宽()`
+   整数除得像素比（本机实测 = 2）。图集字号取 `字体基准(=40) × 像素比`，
+   其余字号按比例缩小绘制（缩小比放大小清晰）。
+9. 本机工具链路径（实测可用）：
    - xtc：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/xtc`
    - 运行时 C：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/`
    - macOS raylib 6.0：`~/Library/Caches/xtl/raylib/darwin-arm64/libraylib.a`
