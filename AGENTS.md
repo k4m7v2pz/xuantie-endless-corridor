@@ -78,6 +78,10 @@ bash scripts/关闭.sh            # 关掉本项目所有残留窗口
    版本差提醒：本地分发包 `渲染.xt` 只有 `取屏幕宽()`，**没有**上游 master 已导出的
    `取缩放系数()`/`取渲染宽()`（上游 1127/1141/1154 行），所以项目里自己声明
    `外 函 XT_GetRenderWidth(): 整`。分发包更新后可改用官方导出。
+
+   **上游若落地 `加载字体高清(文件, 逻辑字号, 参考)`（内部自动 ×缩放系数）**，
+   本项目应把 `建字体()` 退化成一行调用它，不要继续手算像素比——
+   换算逻辑归库，应用侧只传「屏幕上看到多大」。
 9. 本机工具链路径（实测可用）：
    - xtc：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/xtc`
    - 运行时 C：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/`
