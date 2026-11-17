@@ -21,6 +21,8 @@
 cd /Users/user2/Documents/Code.localized/xuantie-endless-corridor
 rvs scripts/build-macos.rvs     # 一键构建，产物 ./corridor
 rvs scripts/test-macos.rvs      # 构建 + 短时运行验证（4 秒自动关闭）
+bash scripts/运行.sh            # 日常启动：先关旧窗口再启动，永远一个实例
+bash scripts/关闭.sh            # 关掉本项目所有残留窗口
 ```
 
 - 渲染程序 xtc tie 链接阶段必失败（渲染包 raylib 是 Windows 构建，预期）；
