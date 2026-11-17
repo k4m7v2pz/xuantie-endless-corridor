@@ -78,6 +78,19 @@ rvs scripts/test-macos.rvs      # 构建 + 短时运行验证（4 秒自动关�
      `git restore --staged <file>` 摘出，替换为占位符或删除后重新 `git add`；
   3. 确认无泄漏再 `git commit`。
 
+## 资产仓库（美术 / 音效 / 图块）
+
+素材不随本仓库分发，在独立仓库 `k4m7v2pz/assets-endless-corridor`：
+
+```bash
+git clone git@github.com:k4m7v2pz/assets-endless-corridor.git assets
+```
+
+`assets/` 已 gitignore（独立仓库，避免二次纳入）。目录约定：
+`sounds/`（音效，按场景分子目录，如 `door/`、`paranoia/`）、`tiles/`（图块，含
+`@2x` 高清版）、`design/`（FL Studio 工程与导出）。授权见该仓库 `LICENSE`
+（木兰开放作品 BY-PL v1；`sounds/music/suno_ai/` 例外）。
+
 ## 目录结构
 
 - `主函数.xt` — 入口（最小垂直切片：窗口+移动+地砖+暗角+手电筒光照）

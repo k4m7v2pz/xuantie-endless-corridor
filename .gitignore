@@ -9,3 +9,5 @@ XuanTie-Lang/
 corridor
 播放器
 日志/
+# 资产仓库（独立 git 仓库，按需 clone 到 assets/）
+assets/
