@@ -49,7 +49,10 @@ bash scripts/关闭.sh            # 关掉本项目所有残留窗口
    `（）`、`Q`、`_` 等非汉字），改任何界面文案都要同步更新参考串。
    现参考串由「三份剧情 JSON 全文 + 界面固定字串」拼成（剧情文本自动覆盖），
    新增界面文案里的符号（如 `；` `─`）仍须补进那条固定字串。
-5. 本机工具链路径（实测可用）：
+6. **裸名撞渲染库导出**：`xtc` 会报 `W007 命名空间撞名（裸名绑定）`，
+   但只是警告、照样出产物，运行时静默走错分支或崩。实测变量名 `暂停` 与渲染库
+   `公 函 暂停(秒数)` 撞名，改名 `暂停中` 才干净。**起名先 grep 渲染库导出名**。
+7. 本机工具链路径（实测可用）：
    - xtc：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/xtc`
    - 运行时 C：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/`
    - macOS raylib 6.0：`~/Library/Caches/xtl/raylib/darwin-arm64/libraylib.a`
