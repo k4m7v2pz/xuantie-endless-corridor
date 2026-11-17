@@ -47,6 +47,8 @@ bash scripts/关闭.sh            # 关掉本项目所有残留窗口
    循环结束后再调一次 `关闭窗口`**。cli 里 `断` 是 break、`续` 是 continue。
 4. 绘制文本走 `加载字体精准`，**未进参考串的字符显示问号**（含全角括号
    `（）`、`Q`、`_` 等非汉字），改任何界面文案都要同步更新参考串。
+   现参考串由「三份剧情 JSON 全文 + 界面固定字串」拼成（剧情文本自动覆盖），
+   新增界面文案里的符号（如 `；` `─`）仍须补进那条固定字串。
 5. 本机工具链路径（实测可用）：
    - xtc：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/xtc`
    - 运行时 C：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/`
