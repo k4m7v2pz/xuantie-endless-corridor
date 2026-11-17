@@ -41,7 +41,13 @@ bash scripts/关闭.sh            # 关掉本项目所有残留窗口
    `corridor`/`改名测试`/`test-main` 均正常。
 2. 把 macOS raylib 替换进 xtc-package/lib/渲染/ 让 xtc 原生链接"成功"是死路
    （产物必崩），已还原；构建一律走 IR 截获 + clang 手动链接。
-3. 本机工具链路径（实测可用）：
+3. **关窗必须在循环外**：在循环体内调 `R.关闭窗口()` 后若不跳出，下一轮
+   `开始绘图` 会在已销毁的 GL 上下文上跑，崩溃于 `DrawRectanglePro → rlVertex3f`
+   （EXC_BAD_ACCESS）。**做法：按键只置 `退出 = 真`，循环末尾 `若 退出 { 断 }`，
+   循环结束后再调一次 `关闭窗口`**。cli 里 `断` 是 break、`续` 是 continue。
+4. 绘制文本走 `加载字体精准`，**未进参考串的字符显示问号**（含全角括号
+   `（）`、`Q`、`_` 等非汉字），改任何界面文案都要同步更新参考串。
+5. 本机工具链路径（实测可用）：
    - xtc：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/xtc`
    - 运行时 C：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/`
    - macOS raylib 6.0：`~/Library/Caches/xtl/raylib/darwin-arm64/libraylib.a`
