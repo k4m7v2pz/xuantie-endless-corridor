@@ -83,6 +83,10 @@ bash tests/浮点内存阈值.sh      # 浮点内存回归判据（详见「已�
 - macOS raylib 6.0：`~/Library/Caches/xtl/raylib/darwin-arm64/libraylib.a`
 - 玄铁临时 Cache（IR 截获轮询目录）：`/var/folders/4x/.../T/XuanTie/Cache`
 
+查渲染库 API 请 grep 上面 xtc-package 里那份 `lib/渲染/渲染.xt`（当前 1.3.11，含
+`合成音效`/`合成器(频率,毫秒,选项)`）。仓库内 `tiepm_modules/渲染/渲染.xt` 是**旧副本**，
+没有这些入口——照它判断 API 会得出"库不支持合成器"的错误结论。
+
 ## 提交规范（简体中文 + Co-Authored-By）
 
 - Conventional Commits（`feat:`/`fix:`/`docs:`/`refactor:`…），**主题用简体中文**；
