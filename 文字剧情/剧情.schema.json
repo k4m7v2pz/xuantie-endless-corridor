@@ -145,8 +145,10 @@
           "type": "object",
           "description": "进节点时合成一声正弦音。不建窗口也能响（渲染库音频设备与窗口解耦）。",
           "additionalProperties": false,
-          "required": ["毫秒"],
+          "required": [],
           "properties": {
+            "文件": { "type": "string", "description": "音效 wav 路径（相对故事目录），由 生成音效.py 产出的 FM 音。与 序列 二选一" },
+            "序列": { "type": "array", "description": "一个节点里排几条音。每项 {文件, 间隔}，间隔是距上一条的毫秒。播放排在正文之后，正文读完时正好在滴", "items": { "type": "object", "properties": { "文件": { "type": "string" }, "间隔": { "type": "integer", "minimum": 0, "maximum": 8000 } } } },
             "频率": { "type": "integer", "minimum": 0, "maximum": 20000, "description": "赫兹。0 表示交给 选项 里的音调/扫频决定" },
             "毫秒": { "type": "integer", "minimum": 50, "maximum": 8000, "description": "时长。短促冲击 200~400，环境底噪 4000~8000" },
             "延迟": { "type": "integer", "minimum": 0, "maximum": 6000, "description": "进节点后隔多久才响（毫秒）。正文先出、声音后到，靠这个做惊吓时机；播放器会忙等，别超过 1 秒" },
