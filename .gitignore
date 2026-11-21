@@ -11,3 +11,8 @@ corridor
 日志/
 # 资产仓库（独立 git 仓库，按需 clone 到 assets/）
 assets/
+
+# 文字剧情播放器：剧情（含角色名，IP 衍生内容）与本地产物不入库
+文字剧情/*/剧情/
+文字剧情/*/play
+.DS_Store
