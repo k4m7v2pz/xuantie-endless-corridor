@@ -137,6 +137,16 @@
             }
           }
         },
+        "声": {
+          "type": "object",
+          "description": "进节点时合成一声正弦音。不建窗口也能响（渲染库音频设备与窗口解耦）。",
+          "additionalProperties": false,
+          "required": ["频率", "毫秒"],
+          "properties": {
+            "频率": { "type": "integer", "minimum": 20, "maximum": 20000, "description": "赫兹。人耳 20~20000，低频 100~200 像闷响，400~800 像提示音" },
+            "毫秒": { "type": "integer", "minimum": 50, "maximum": 5000, "description": "时长，别超过玩家读这段字的时间" }
+          }
+        },
         "注": {
           "type": "object",
           "description": "给人和 AI 看的解释，播放器完全不输出。约定子键：说明（这段为什么这样写）、真相（玩家看不到的真实状态）、意图（一句话标签）。其余键自由。",
