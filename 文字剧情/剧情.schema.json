@@ -1,0 +1,153 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://xuantie-endless-corridor/文字剧情/剧情.schema.json",
+  "title": "文字剧情播放器剧本",
+  "description": "两空格缩进。剧情文件本身不入库（含角色名），本 Schema 入库，供编辑器/AI 校验结构。目录.json 与幕文件共用一个 Schema，用 oneOf 区分。",
+  "oneOf": [
+    { "$ref": "#/definitions/目录" },
+    { "$ref": "#/definitions/幕文件" }
+  ],
+  "definitions": {
+    "目录": {
+      "type": "object",
+      "required": ["作品", "幕"],
+      "additionalProperties": false,
+      "properties": {
+        "作品": {
+          "type": "string",
+          "minLength": 1,
+          "description": "标题画面显示的作品名"
+        },
+        "幕": {
+          "type": "array",
+          "minItems": 1,
+          "description": "播放顺序；同一幕可重复出现以构成循环",
+          "items": { "type": "string", "description": "相对故事目录的幕文件路径" }
+        }
+      }
+    },
+    "幕文件": {
+      "type": "object",
+      "required": ["幕编号", "幕名", "起始", "事件"],
+      "additionalProperties": false,
+      "properties": {
+        "幕编号": { "type": "integer", "minimum": 1 },
+        "幕名": { "type": "string", "minLength": 1 },
+        "起始": { "type": "string", "minLength": 1, "description": "起始节点名，必须在 事件 里存在" },
+        "过场": { "type": "string", "description": "进入本幕时先打印的过场文字，可省" },
+        "事件": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/definitions/节点" }
+        }
+      }
+    },
+    "节点": {
+      "type": "object",
+      "required": ["标题", "正文"],
+      "additionalProperties": false,
+      "properties": {
+        "标题": { "type": "string", "minLength": 1 },
+        "正文": {
+          "type": "array",
+          "description": "逐行输出；空字符串等于空行",
+          "items": { "type": "string" }
+        },
+        "红字": {
+          "type": "array",
+          "description": "正文之后以红色输出，通常只放一句重点",
+          "items": { "type": "string" }
+        },
+        "后继": {
+          "type": ["string", "null"],
+          "description": "下一个节点名；null 表示本幕结束，空串等同 null"
+        },
+        "选项": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["文字", "到"],
+            "additionalProperties": false,
+            "properties": {
+              "文字": { "type": "string", "minLength": 1 },
+              "到": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "谜题": {
+          "type": "object",
+          "required": ["提示", "对白", "对", "错白", "错"],
+          "additionalProperties": false,
+          "properties": {
+            "提示": { "type": "string" },
+            "答案": { "type": ["string", "null"] },
+            "可接受": { "type": "array", "items": { "type": "string" } },
+            "对白": { "type": "string", "description": "答对后的叙述" },
+            "对": { "type": "string", "description": "答对后跳到哪个节点" },
+            "错白": { "type": "string", "description": "答错后的叙述" },
+            "错": { "type": "string", "description": "答错后跳到哪个节点（绕过）" },
+            "变体": {
+              "type": "array",
+              "description": "一题多个正确答案，各配不同对白与去处；判定先查变体再退回可接受",
+              "items": {
+                "type": "object",
+                "required": ["接受", "对白", "对"],
+                "additionalProperties": false,
+                "properties": {
+                  "接受": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                  "对白": { "type": "string" },
+                  "对": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "调查": {
+          "type": "object",
+          "required": ["出口", "对象"],
+          "additionalProperties": false,
+          "properties": {
+            "出口": { "type": "string", "description": "默认走向；收集件数够时被 按件数 覆盖" },
+            "按件数": {
+              "type": "array",
+              "description": "按行囊件数分流，阈值高的先匹配",
+              "items": {
+                "type": "object",
+                "required": ["件数", "到"],
+                "additionalProperties": false,
+                "properties": {
+                  "件数": { "type": "integer", "minimum": 1 },
+                  "到": { "type": "string" }
+                }
+              }
+            },
+            "对象": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["名", "话"],
+                "additionalProperties": false,
+                "properties": {
+                  "名": { "type": "string", "minLength": 1 },
+                  "话": { "type": "string", "description": "查看了什么；多数对象只给一句话、不给东西" },
+                  "给": { "type": ["string", "null"], "description": "收进行囊的物品名；null 表示只是看一眼" }
+                }
+              }
+            }
+          }
+        },
+        "注": {
+          "type": "object",
+          "description": "给人和 AI 看的解释，播放器完全不输出。约定子键：说明（这段为什么这样写）、真相（玩家看不到的真实状态）、意图（一句话标签）。其余键自由。",
+          "additionalProperties": true,
+          "properties": {
+            "说明": { "type": "string" },
+            "真相": { "type": "string" },
+            "意图": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
