@@ -7,7 +7,10 @@
 2. **公开仓库**：不得提交 token/私钥/真实 IP/端口/邮箱/真名，举例一律用占位符。
 3. **剧情只放 `剧情/幕NN.json`**，`.xt` 只承载引擎与渲染。
 4. **本仓库没有 CI**（无本地门禁、远端无 Actions/流水线），测试只能手动跑。
-5. 动渲染/入口后至少 `rvs scripts/test-macos.rvs` 跑一次再提交。
+5. 改完跑**对应那一侧**再提交：
+   - 渲染程序（`主函数.xt`/`scripts/`）→ `rvs scripts/test-macos.rvs`
+   - TUI 播放器（`文字剧情/**`）→ `bash run-story.sh`
+     + `python3 文字剧情/校验剧情.py 文字剧情/我还会回来 文字剧情/恐哀`
 
 ## 项目定位
 
@@ -46,6 +49,8 @@ bash tests/浮点内存阈值.sh      # 浮点内存回归判据（详见「已�
    （如"主函数"是入口名、"无尽回廊"在标题里），启动即崩（Trace/BPT trap: 5，
    glfwInit → CFBundle 断言）。**规避：产物统一命名 `corridor`**。
    实测崩：`主函数`/`主函数b`/`无尽回廊`；正常：`corridor`/`改名测试`/`test-main`。
+   **两个产物互不相干、各叫各的**：渲染程序 `corridor`，TUI 播放器 `play`（`-sc play`）。
+   别为了"统一"把 `play` 改成 `corridor`。
 2. **关窗必须在循环外**：循环体内调 `R.关闭窗口()` 后不跳出，下一轮 `开始绘图` 会在
    已销毁的 GL 上下文上跑（`DrawRectanglePro → rlVertex3f`，EXC_BAD_ACCESS）。
    **做法：按键只置 `退出 = 真`，循环末尾 `若 退出 { 断 }`，循环外再调一次关闭窗口**。
