@@ -137,6 +137,10 @@
             }
           }
         },
+        "打字": {
+          "description": "真=默认每字 140 毫秒；整数=每字毫秒。正文逐字出现，每字一响 50ms 短点击。不写则整行一次输出。",
+          "oneOf": [ { "type": "boolean" }, { "type": "integer", "minimum": 60, "maximum": 600 } ]
+        },
         "声": {
           "type": "object",
           "description": "进节点时合成一声正弦音。不建窗口也能响（渲染库音频设备与窗口解耦）。",
