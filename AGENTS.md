@@ -1,19 +1,25 @@
 # AGENTS.md — xuantie-endless-corridor 项目约定
 
+## 先读这块（每次都要遵守）
+
+1. **提交**：Conventional Commits + **简体中文主题** + 空行后 `Co-Authored-By` trailer；
+   改完一个可验证单元就提交并推送 `dev`，不必逐次请示（详见「提交规范」）。
+2. **公开仓库**：不得提交 token/私钥/真实 IP/端口/邮箱/真名，举例一律用占位符。
+3. **剧情只放 `剧情/幕NN.json`**，`.xt` 只承载引擎与渲染。
+4. **本仓库没有 CI**（无本地门禁、远端无 Actions/流水线），测试只能手动跑。
+5. 动渲染/入口后至少 `rvs scripts/test-macos.rvs` 跑一次再提交。
+
 ## 项目定位
 
-「无尽回廊」是一款恐怖 RPG（对标 RPG Maker XP/MV/MZ 系的喜羊羊恐怖改版一类：
-黑暗走廊、有限光照、压抑氛围）。本项目是**用玄铁 (XuanTie) 中文编程语言
-+ 官方「渲染」库（raylib 桥接）实现的尝试性重构**：
+「无尽回廊」是一款恐怖 RPG（对标 RPG Maker 系的喜羊羊恐怖改版一类：黑暗走廊、
+有限光照、压抑氛围）。本项目是用**玄铁 (XuanTie) 中文编程语言 + 官方「渲染」库
+（raylib 桥接）**实现的尝试性重构：
 
-- 最终实现语言：玄铁（本项目）；
-- 功能参考：`rust-bevy-endless-corridor`（Rust Bevy 版，只读参考）；
-- 入门参考：`xuantie-life-game`（玄铁 + 渲染库的已验证范本，构建流程照搬自它）；
-- 工具链：`xtl-toolchain`（玄铁 CLI，类 uv/cargo）。
+- 功能参考 `rust-bevy-endless-corridor`（Rust Bevy 版，只读）；
+- 构建流程照搬 `xuantie-life-game`；工具链 `xtl-toolchain`（类 uv/cargo）。
 
-⚠️ **项目定性**：玄铁语言当前为 1.0-rc（红色预发布徽章、单人开发、官方定位
-"游戏引擎让给 Unity/Godot"）。本项目是**尝试性垂直验证**，不是稳定产品。
-先跑通最小切片，再逐步扩充。
+⚠️ 玄铁当前 1.0-rc（单人开发、官方定位"游戏引擎让给 Unity/Godot"）。本项目是
+**尝试性垂直验证**，不是稳定产品：先跑通最小切片，再逐步扩充。
 
 ## 构建与测试（macOS arm64）
 
@@ -23,151 +29,106 @@ rvs scripts/build-macos.rvs     # 一键构建，产物 ./corridor
 rvs scripts/test-macos.rvs      # 构建 + 短时运行验证（4 秒自动关闭）
 bash scripts/运行.sh            # 日常启动：先关旧窗口再启动，永远一个实例
 bash scripts/关闭.sh            # 关掉本项目所有残留窗口
+bash run-story.sh               # TUI 剧情播放器（参数 2 跑《恐哀》）；
+                                # 故事目录内也有 运行.sh，缺产物会自动重编译
+bash tests/浮点内存阈值.sh      # 浮点内存回归判据（详见「已知坑」8）
 ```
 
-- 渲染程序 xtc tie 链接阶段必失败（渲染包 raylib 是 Windows 构建，预期）；
-  由 `scripts/xtc-抓IR.sh` 轮询截获 LLVM IR，再 clang 手动链接
-  （运行时 C + 渲染桥 + macOS raylib + frameworks）。
-- 测试脚本的短时运行验证在 `scripts/bash/run-check.sh`：SIGKILL 清理旧实例、
-  单窗口运行 4 秒、强制关闭、结果写入 `/tmp/xtl-test.state`（ALIVE/CRASHED/NO_BINARY）。
+- 渲染程序 `xtc tie` 链接阶段**必失败**（渲染包 raylib 是 Windows 构建，预期）：
+  由 `scripts/xtc-抓IR.sh` 轮询截获 LLVM IR，再 clang 手动链接。
+  **别试图把 macOS raylib 塞进 xtc-package 让它"链接成功"**，产物必崩，已还原。
+- 短时运行验证在 `scripts/bash/run-check.sh`：SIGKILL 清理旧实例、单窗口跑 4 秒、
+  强制关闭，结果写 `/tmp/xtl-test.state`（ALIVE/CRASHED/NO_BINARY）。
 
 ## ⚠️ 玄铁 1.0-rc 已知坑（实测，勿重踩）
 
-1. **可执行产物名冲突崩溃**：若链接产物名与源码文本中的字样重名
-   （如"主函数"是入口文件名、"无尽回廊"出现在注释/标题），启动即崩
-   （Trace/BPT trap: 5，崩溃点 glfwInit → _glfwInitCocoa → CFBundle 断言）。
-   **规避：产物统一命名 `corridor`**（源码入口仍为 `主函数.xt`，xtl.json 不变）。
-   验证样本：`主函数`/`主函数b`/`无尽回廊` 作产物名均崩；
-   `corridor`/`改名测试`/`test-main` 均正常。
-2. 把 macOS raylib 替换进 xtc-package/lib/渲染/ 让 xtc 原生链接"成功"是死路
-   （产物必崩），已还原；构建一律走 IR 截获 + clang 手动链接。
-3. **关窗必须在循环外**：在循环体内调 `R.关闭窗口()` 后若不跳出，下一轮
-   `开始绘图` 会在已销毁的 GL 上下文上跑，崩溃于 `DrawRectanglePro → rlVertex3f`
-   （EXC_BAD_ACCESS）。**做法：按键只置 `退出 = 真`，循环末尾 `若 退出 { 断 }`，
-   循环结束后再调一次 `关闭窗口`**。cli 里 `断` 是 break、`续` 是 continue。
-4. 绘制文本走 `加载字体精准`，**未进参考串的字符显示问号**（含全角括号
-   `（）`、`Q`、`_` 等非汉字），改任何界面文案都要同步更新参考串。
-   现参考串由「三份剧情 JSON 全文 + 界面固定字串 + `剧情/界面.json` 的文案」拼成
-   （剧情与界面文案都自动覆盖），新增引擎内部固定文案里的符号（如 `；` `─`）
-   仍须补进那条固定字串。
+1. **产物名不能与源码文本重名**：链接产物名若与源码里出现过的字样相同
+   （如"主函数"是入口名、"无尽回廊"在标题里），启动即崩（Trace/BPT trap: 5，
+   glfwInit → CFBundle 断言）。**规避：产物统一命名 `corridor`**。
+   实测崩：`主函数`/`主函数b`/`无尽回廊`；正常：`corridor`/`改名测试`/`test-main`。
+2. **关窗必须在循环外**：循环体内调 `R.关闭窗口()` 后不跳出，下一轮 `开始绘图` 会在
+   已销毁的 GL 上下文上跑（`DrawRectanglePro → rlVertex3f`，EXC_BAD_ACCESS）。
+   **做法：按键只置 `退出 = 真`，循环末尾 `若 退出 { 断 }`，循环外再调一次关闭窗口**。
+   `断`=break、`续`=continue。
+3. **裸名撞渲染库导出**：`xtc` 只报 `W007 命名空间撞名（裸名绑定）`，照样出产物，
+   运行时静默走错分支或崩。实测变量 `暂停` 撞 `公 函 暂停(秒数)`，改 `暂停中` 才干净。
+   **起名先 grep 渲染库导出名**。
+4. **字体与文案**：未进参考串的字符显示问号（含全角括号 `（）`、`Q`、`_`）；
+   图集必须按「最大字号 × 屏幕像素比」光栅化，唯一入口是 `建字体(路径, 参考串, 像素比)`，
+   **不要再直接调 `加载字体精准`**。界面文案走 `剧情/界面.json`（含 `字体`/`补充字`）。
+   → 细则见 `docs/渲染-字体与Retina.md`。
+5. **`示()` 恒带换行**；字符串字面量不支持 `\xNN`；`时.延时()` 编译过但运行炸（自建忙等）。
+6. **`个 / 48000` 是整数除法**（恒 0），`小数(x) / 整数` 同样被截断
+   → `docs/玄铁数值语义-小数除整数被截断.md`。写浮点探针必须 `个 * 1.0 / 率`。
+7. **浮点长循环内存严格线性上涨**：单函数内逐样本浮点运算 + `数学.正弦`/`数学.幂`，
+   每轮分配不回收，约 **709 字节/轮**（100 万轮 = 709 MB；时间不慢，1.1 s）。
+   千万级才到 GB 并被 SIGKILL(137)，表现为"跑着跑着消失"。
+   **音频与大规模数值计算不要在玄铁里做**：交给 `文字剧情/生成音效.py` 这类外部脚本
+   生成文件，玄铁侧只 `加载音效`/读文件。完整复现与给上游的修法建议见
+   `docs/玄铁缺陷-浮点逐样本运算内存暴涨.md`（含"修好了怎么验"的判据）。
+   附带可用结论：`字节(n)` + `.追加(x)` + `文件.写(路径, 字节)` 是二进制安全的。
+8. **回归判据**：`bash tests/浮点内存阈值.sh` 五点 RSS，约 5 s，未修时正常返回 FAIL；
+   `--压` 是千万轮重压（现在必然被 SIGKILL）。**本仓库没有 CI**，它不会自动跑，
+   别当门禁。
 
-   **界面文案（标题、主菜单三项、暂停菜单三项）走 `剧情/界面.json`**，启动时读取并
-   自动并入参考串，所以作者写什么字都能显示；缺字段回退内置默认值。按键提示、
-   机制提示与错误反馈属于引擎，不放该文件。
+本机工具链路径（实测可用）：
 
-   该文件还有两个字段：`字体`（字体文件路径，发布版应换 SIL OFL 字体自带分发——
-   渲染桥不支持 ttc 里 CFF/OTTO 首 face，要单文件 TTF）、`补充字`（想把新写的引擎
-   文案整句粘进来就能进字库，省得漏字出问号；实测 `※` `§` 这类符号也正常）。
-6. **裸名撞渲染库导出**：`xtc` 会报 `W007 命名空间撞名（裸名绑定）`，
-   但只是警告、照样出产物，运行时静默走错分支或崩。实测变量名 `暂停` 与渲染库
-   `公 函 暂停(秒数)` 撞名，改名 `暂停中` 才干净。**起名先 grep 渲染库导出名**。
-8. **字体图集按「最大绘制字号 × 屏幕像素比」光栅化**（macOS Retina 实测）：
-   渲染桥已设 `FLAG_WINDOW_HIGHDPI`，2x 屏上 40 号字实际占 80 物理像素；
-   若图集仍按 24 或 40 光栅化，标题放大会糊（肉眼看就是"低分辨率/像素感"）。
-   `渲染.xt` 没导出缩放系数，但桥里有 `XT_GetRenderWidth`——项目里自己声明
-   `外 函 XT_GetRenderWidth(): 整`，用 `XT_GetRenderWidth() / R.取屏幕宽()`
-   整数除得像素比（本机实测 = 2）。图集字号取 `字体基准(=40) × 像素比`，
-   其余字号按比例缩小绘制（缩小比放大小清晰）。
-
-   **唯一建字体入口是 `建字体(路径, 参考串, 像素比)`**：它内部取「所有字号档位的
-   最大值 × 像素比」自动算光栅化字号，所以改 `字号标题` 等常量时图集分辨率会
-   自动跟着走。**不要再直接调 `加载字体精准`**——那一步最容易把 24 这种"显示字号"
-   当成光栅化字号传进去，Retina 上就糊。
-   字号档位集中在 `字号标题/字号菜单/字号正文/字号提示` 四个常量，绘制时不散写数字。
-
-   版本差提醒：本地分发包 `渲染.xt` 只有 `取屏幕宽()`，**没有**上游 master 已导出的
-   `取缩放系数()`/`取渲染宽()`（上游 1127/1141/1154 行），所以项目里自己声明
-   `外 函 XT_GetRenderWidth(): 整`。分发包更新后可改用官方导出。
-
-   **上游若落地 `加载字体高清(文件, 逻辑字号, 参考)`（内部自动 ×缩放系数）**，
-   本项目应把 `建字体()` 退化成一行调用它，不要继续手算像素比——
-   换算逻辑归库，应用侧只传「屏幕上看到多大」。
-9. 本机工具链路径（实测可用）：
-   - xtc：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/xtc`
-   - 运行时 C：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/`
-   - macOS raylib 6.0：`~/Library/Caches/xtl/raylib/darwin-arm64/libraylib.a`
-   - 玄铁临时 Cache（IR 截获轮询目录）：
-     `/var/folders/4x/.../T/XuanTie/Cache`
-
-10. **浮点长循环内存严格线性上涨**：单函数内逐样本做浮点运算 + 数学函数调用
-    （`数学.正弦`/`数学.幂`），每轮分配不回收，约 **709 字节/轮**（实测 100 万轮 = 709 MB）。
-    时间不慢（百万轮 1.1 s），**千万级样本**才到 GB 并被 SIGKILL(137)。
-    注意：`个 / 48000` 是整数除法，照抄那段"复现"根本不会触发缺陷；
-    `小数(x) / 整数` 同样被截断，见 `docs/玄铁数值语义-小数除整数被截断.md`。
-    **音频与大规模数值计算不要在玄铁里做**，交给 `文字剧情/生成音效.py` 这类外部脚本
-    生成文件，玄铁侧只 `加载音效` / 读文件。若被问"玄铁有没有缺陷"，完整复现与建议见
-    `docs/玄铁缺陷-浮点逐样本运算内存暴涨.md`。
-    附带可用结论：`字节(n)` + `.追加(x)` + `文件.写(路径, 字节)` 是二进制安全的。
-    回归判据已做成脚本：`bash tests/浮点内存阈值.sh`（五点 RSS，约 5 s，未修时正常返回
-    FAIL；`--压` 是千万轮重压，现在必然被 SIGKILL）。**本仓库没有 CI**，这个脚本
-    不会自动跑，只能手动执行——别把它当门禁。
+- xtc：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/xtc`
+- 运行时 C：`~/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime/`
+- macOS raylib 6.0：`~/Library/Caches/xtl/raylib/darwin-arm64/libraylib.a`
+- 玄铁临时 Cache（IR 截获轮询目录）：`/var/folders/4x/.../T/XuanTie/Cache`
 
 ## 提交规范（简体中文 + Co-Authored-By）
 
-- 提交信息用 Conventional Commits（`feat:` / `fix:` / `docs:` / `refactor:` 等），
-  **主题用简体中文描述**；末尾 trailer（空行隔开）用 `Co-Authored-By`，
-  名字填写**实际调用工具、执行本次提交的模型/Agent**（不是写代码的模型，
-  二者可能不同）；`noreply@` 域名无对应则不写域名只留名字。
-  格式示例：`Co-Authored-By: <实际提交的Agent名> <noreply@<对应域名>>`。
-
-### Agent 自动提交推送约定（本仓库工作方式）
-
-- 本项目的开发流程中，**AI agent 负责编码、提交、推送**（dev 分支），
-  在人类视角上表现为"agent 自动提交推送"。
-- Agent 完成一个可验证的改动单元后**自动提交并推送**到 `dev` 分支，
-  无需逐次征求人类确认；提交信息遵守上方规范（简体中文 + Co-Authored-By）。
-- 涉及公开仓库的**外发动作**（PR / issue / 追评）仍需如实标注
-  人类参与程度，禁止声称"人类已批准/已审阅"未经批准的内容。
+- Conventional Commits（`feat:`/`fix:`/`docs:`/`refactor:`…），**主题用简体中文**；
+  主题一行讲清"改了什么"，需要背景就空行后写正文。
+- 末尾 trailer（空行隔开）`Co-Authored-By`：名字填**实际执行本次提交的 Agent/模型**
+  （不是写代码的那个，二者可能不同）；无对应域名就只留名字。
+  `Co-Authored-By: <Agent名> <noreply@<域名>>`。
+- **一次提交 = 一个可验证的改动单元**；改完自动提交推送 `dev`，无需逐次请示。
+- 公开仓库的**外发动作**（PR/issue/追评）不得声称"人类已批准/已审阅"未经批准的内容。
 
 ### 提交前防泄漏守卫（公开仓库，硬约束）
 
-本仓库公开，进入 git 的内容默认互联网可见。**禁止提交**：
-私钥/token/密码、个人邮箱、真实姓名、私人服务器地址、代理端口、
-内部 IP、SSH 口令、VPS/VM 连接信息。
+进入 git 的内容默认互联网可见。**禁止提交**：私钥/token/密码、个人邮箱、真实姓名、
+私人服务器地址、代理端口、内部 IP、SSH 口令、VPS/VM 连接信息。
+文档举例一律占位符：`<example@example.com>`、`<proxy-port>`、`<host>`。
 
-- 文档里举例远端/邮箱/端口一律用占位符：`<example@example.com>`、
-  `<proxy-port>`、`<host>`。
-- **提交前核对流程（不得跳过）**：
-  1. `git add` 后先 `git diff --cached --name-only` 确认暂存区文件清单，
-     无 `secrets/`、`*.pem`、`id_rsa`、`id_ed25519`、`*.key`、`credentials` 等；
-  2. `git diff --cached` 扫内容，发现真实 IP / 端口 / 邮箱 / token →
-     `git restore --staged <file>` 摘出，替换为占位符或删除后重新 `git add`；
-  3. 确认无泄漏再 `git commit`。
+提交前（不得跳过）：① `git diff --cached --name-only` 核对文件清单，无
+`secrets/`、`*.pem`、`id_rsa`、`id_ed25519`、`*.key`、`credentials`；
+② `git diff --cached` 扫内容，命中真实 IP/端口/邮箱/token 就
+`git restore --staged <file>`，换占位符或删掉再 `git add`；③ 干净了再 commit。
 
 ## 资产仓库（美术 / 音效 / 图块）
 
 素材不随本仓库分发，在独立仓库 `k4m7v2pz/assets-endless-corridor`：
-
-```bash
-git clone git@github.com:k4m7v2pz/assets-endless-corridor.git assets
-```
-
-`assets/` 已 gitignore（独立仓库，避免二次纳入）。目录约定：
-`sounds/`（音效，按场景分子目录，如 `door/`、`paranoia/`）、`tiles/`（图块，含
-`@2x` 高清版）、`design/`（FL Studio 工程与导出）。授权见该仓库 `LICENSE`
+`git clone git@github.com:k4m7v2pz/assets-endless-corridor.git assets`（`assets/` 已 gitignore）。
+目录：`sounds/`（按场景分子目录，如 `door/`、`paranoia/`）、`tiles/`（含 `@2x`）、
+`design/`（FL Studio 工程与导出）。授权见该仓库 `LICENSE`
 （木兰开放作品 BY-PL v1；`sounds/music/suno_ai/` 例外）。
 
 ## 剧情与代码的分工（硬约束，勿违反）
 
 - **剧情一律放 `剧情/幕NN.json`，`.xt` 只承载引擎与渲染。**
-  理由：游戏源码可外流（别人可能只传二进制和配置），源码里不该躺着剧情；
+  理由：源码可外流（别人可能只传二进制和配置），源码里不该躺着剧情；
   引擎通用、剧情可换。新增/改剧情只动 JSON，不动 `.xt`。
-- 节点类型由 JSON 的 `类型` 字段驱动：必经 / 谜题 / 绕过 / 分支 / 结局。
-  `主函数.xt` 按这些类型分流，不为某一幕写特例。
-- 每个解谜节点在 JSON 里必须同时有 `对` 与 `错`（绕过节点），
-  且 `错` 不能造成死局 —— 玩家卡住时按 Q 或错满自动走绕过。
+- 节点类型由 JSON 的 `类型` 驱动：必经 / 谜题 / 绕过 / 分支 / 结局。
+  引擎按类型分流，不为某一幕写特例。
+- 每个解谜节点必须同时有 `对` 与 `错`（绕过节点），且 `错` 不能造成死局——
+  玩家卡住时按 Q 或错满自动走绕过。
 - 谜题答案为字符串，格式差异用 `可接受` 数组收（`7` 与 `07` 都算）；
   玩家输入只接受数字（汉字退格删不满一个字宽，实测出过问题）。
 
 ## 目录结构
 
 - `主函数.xt` — 入口（最小垂直切片：窗口+移动+地砖+暗角+手电筒光照）
-- `scripts/build-macos.rvs` — macOS 一键构建（rvs 主脚本）
-- `scripts/test-macos.rvs` — macOS 构建 + 短时运行验证
-- `scripts/xtc-抓IR.sh` — xtc 链接失败时轮询截获 LLVM IR 的 helper
-- `scripts/bash/run-check.sh` — 短时运行验证 helper（SIGKILL 清理）
+- `文字剧情/` — TUI 剧情播放器（`README.md` 是字段表与音频/打字机写法）、
+  `校验剧情.py`、`生成音效.py`（FM→WAV）、`音效表.json`
+- `scripts/` — `build-macos.rvs`、`test-macos.rvs`、`xtc-抓IR.sh`、
+  `bash/run-check.sh`（各自用途见「构建与测试」）
+- `tests/` — 浮点内存探针与阈值脚本（手动跑，无 CI）
+- `docs/` — 缺陷记录、数值语义、渲染字体细则
 - `patches/渲染桥.c.macos` — 渲染库 macOS 桥接，**同步自工具链内置**
-  `~/.caches/xtl/.../xtc-package/lib/渲染/渲染桥.c`：上游已把 macOS 适配并入内置桥，
-  旧版补丁（复制自 xuantie-life-game）缺 `XT_Translate3D` / `合成器` 等符号会链接失败
-- `tiepm_modules/渲染/` — 渲染库依赖（已打补丁；gitignore）
-- `.tiepm/` — 布局桥接符号链接（gitignore，clone 后由构建脚本重建）
+  `xtc-package/lib/渲染/渲染桥.c`：上游已把 macOS 适配并入内置桥，旧版补丁
+  缺 `XT_Translate3D`/`合成器` 等符号会链接失败
+- `tiepm_modules/渲染/`、`.tiepm/` — 依赖与符号链接（均 gitignore，构建脚本重建）
