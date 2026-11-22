@@ -80,8 +80,8 @@
           "additionalProperties": false,
           "properties": {
             "提示": { "type": "string" },
-            "答案": { "type": ["string", "null"] },
-            "可接受": { "type": "array", "items": { "type": "string" } },
+            "答案": { "type": ["string", "null"], "description": "标准答案。比较前两边都会归一：全角数字转半角、去空格/冒号/斜杠/横线/小数点/下划线、去前导 0" },
+            "可接受": { "type": "array", "description": "额外的正确答案（同值不同写法已被归一化覆盖，这里放 12/24 小时制这种不同的值），全部算对、走 对 与 对白", "items": { "type": "string" } },
             "对白": { "type": "string", "description": "答对后的叙述" },
             "对": { "type": "string", "description": "答对后跳到哪个节点" },
             "错白": { "type": "string", "description": "答错后的叙述" },
