@@ -28,17 +28,18 @@ def walk_nodes(events):
 
 def check(directory):
     errors = []
+    warnings = []
     story_dir = os.path.dirname(directory.rstrip("/")) or "."
     toc_path = os.path.join(directory, "剧情/目录.json")
     if not os.path.exists(toc_path):
-        return [f"找不到 {toc_path}"]
+        return [f"找不到 {toc_path}"], warnings
 
     toc = load(toc_path)
     if not isinstance(toc.get("作品"), str) or not toc["作品"]:
         errors.append("目录.json: 作品 必须是非空字符串")
     acts = toc.get("幕")
     if not isinstance(acts, list) or not acts:
-        return errors + ["目录.json: 幕 必须是非空数组"]
+        return errors + ["目录.json: 幕 必须是非空数组"], warnings
 
     for act_rel in acts:
         act_path = os.path.join(directory, act_rel)
@@ -102,6 +103,9 @@ def check(directory):
                 for k in ("对", "错"):
                     if q.get(k) not in events:
                         errors.append(f"{where}: 谜题的 {k}→「{q.get(k)}」不存在")
+                # 提示太短 = 玩家拿不到信息（软警告，不挡结构通过）
+                if len(q.get("提示") or "") < 6:
+                    warnings.append(f"{where}: 谜题提示「{q.get('提示')}」少于 6 个字，玩家可能只能靠猜")
                 for i, v in enumerate(q.get("变体") or [], 1):
                     if not isinstance(v.get("接受"), list) or not v["接受"]:
                         errors.append(f"{where}: 变体 {i} 缺 接受")
@@ -136,7 +140,7 @@ def check(directory):
 
         del target_keys
 
-    return errors
+    return errors, warnings
 
 
 def main():
@@ -145,7 +149,7 @@ def main():
         return 2
     failed = False
     for d in sys.argv[1:]:
-        errs = check(d)
+        errs, warns = check(d)
         if errs:
             failed = True
             print(f"✗ {d} —— {len(errs)} 个问题")
@@ -153,6 +157,8 @@ def main():
                 print("   " + e)
         else:
             print(f"✓ {d} —— 结构通过")
+        for w in warns:
+            print(f"   ⚠ {w}")
     return 1 if failed else 0
 
 
