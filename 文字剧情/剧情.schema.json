@@ -141,9 +141,9 @@
           "description": "真=默认每字 140 毫秒；整数=每字毫秒。正文逐字出现，每字一响 50ms 短点击。不写则整行一次输出。",
           "oneOf": [ { "type": "boolean" }, { "type": "integer", "minimum": 60, "maximum": 600 } ]
         },
-        "声": {
+        "音效": {
           "type": "object",
-          "description": "进节点时合成一声正弦音。不建窗口也能响（渲染库音频设备与窗口解耦）。",
+          "description": "进节点时响一次音效。可以是成品 wav 文件，也可以是参数化配方（引擎现场合成，不落盘）；不建窗口也能响。",
           "additionalProperties": false,
           "required": [],
           "properties": {
