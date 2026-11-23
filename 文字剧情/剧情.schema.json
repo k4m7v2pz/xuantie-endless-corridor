@@ -147,7 +147,8 @@
           "additionalProperties": false,
           "required": [],
           "properties": {
-            "文件": { "type": "string", "description": "音效 wav 路径（相对故事目录），由 生成音效.py 产出的 FM 音。与 序列 二选一" },
+            "文件": { "type": "string", "description": "成品音频路径（相对内容包根）。wav 短音最稳，ogg 省体积；raylib 也认 mp3/flac。优先使用，打不开才回退配方" },
+            "内置": { "type": "string", "description": "引擎自带的音效名（如 滴、钟），从 引擎/内置音效/<名>.wav 解析。引擎原创素材，可随引擎公开分发" },
             "序列": { "type": "array", "description": "一个节点里排几条音。每项 {文件, 间隔}，间隔是距上一条的毫秒。播放排在正文之后，正文读完时正好在滴", "items": { "type": "object", "properties": { "文件": { "type": "string" }, "间隔": { "type": "integer", "minimum": 0, "maximum": 8000 } } } },
             "频率": { "type": "integer", "minimum": 0, "maximum": 20000, "description": "赫兹。0 表示交给 选项 里的音调/扫频决定" },
             "毫秒": { "type": "integer", "minimum": 50, "maximum": 8000, "description": "时长。短促冲击 200~400，环境底噪 4000~8000" },
