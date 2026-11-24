@@ -2,6 +2,12 @@
 // 将 XuanTie 的 i64 标记指针转换为 raylib 原生 C 类型并调用
 // 编译时与 xt_runtime.c + libraylib.a 一起链接
 //
+// 【来源与许可】本文件改写自玄铁渲染包 lib/渲染/渲染桥.c
+//   上游：https://gitcode.com/MARKJY/XuanTieRendering  作者署名：问号盒
+//   许可：MIT（见该包 tiepm.toml 的 `许可 = "MIT"`）
+//   本副本只额外加入 macOS 适配，版权仍属上游作者，按 MIT 条件再分发；
+//   上游已把这些适配并入内置 渲染桥.c，此文件仅作参考与回滚用。
+//
 // 标记方案 (from xt_runtime.h):
 //   整数: tagged = (raw << 1) | 1   →  untag: raw = (int64_t)(tagged >> 1)
 //   布尔: true = 0x4, false = 0x2   →  untag: tagged == 0x4
