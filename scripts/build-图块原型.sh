@@ -4,6 +4,10 @@
 set -e
 cd "$(dirname "$0")/.."
 PROJ="$PWD"
+
+# 门禁：地图结构与门的对偶先过硬校验，错就不编译（人/AI 都会手抖，靠程序盯着）
+python3 原型/造图.py --校验 原型/地图*.json || { echo "❌ 地图/门校验未过，停止构建"; exit 1; }
+
 XTC="$HOME/Library/Caches/xtl/core/darwin-arm64/xtc-package/xtc"
 RT="$HOME/Library/Caches/xtl/core/darwin-arm64/xtc-package/runtime"
 RL="$HOME/Library/Caches/xtl/raylib/darwin-arm64/libraylib.a"
