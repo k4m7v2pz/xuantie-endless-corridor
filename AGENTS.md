@@ -5,9 +5,11 @@
 1. **提交**：Conventional Commits + **简体中文主题** + 空行后 `Co-Authored-By` trailer；
    改完一个可验证单元就提交并推送 `dev`，不必逐次请示（详见「提交规范」）。
 2. **公开仓库**：不得提交 token/私钥/真实 IP/端口/邮箱/真名，举例一律用占位符。
-3. **剧情只放 `剧情/幕NN.json`**，`.xt` 只承载引擎与渲染。
-4. **本仓库没有 CI**（无本地门禁、远端无 Actions/流水线），测试只能手动跑。
-5. 改完跑**对应那一侧**再提交：
+3. **存档**在 `saves/`（gitignore），一槽一 JSON，`原型/图块地图.xt` 内实现，
+   口径见 `docs/存档界面设计.md`。
+4. **剧情只放 `剧情/幕NN.json`**，`.xt` 只承载引擎与渲染。
+5. **本仓库没有 CI**（无本地门禁、远端无 Actions/流水线），测试只能手动跑。
+6. 改完跑**对应那一侧**再提交：
    - 渲染程序（`主函数.xt`/`scripts/`）→ `rvs scripts/test-macos.rvs`
    - TUI 播放器（`文字剧情/**`）→ `bash run-story.sh`
      + `python3 文字剧情/校验剧情.py 文字剧情/我还会回来 文字剧情/恐哀`
@@ -39,6 +41,7 @@ python3 原型/造图.py --校验 原型/地图*.json   # 图块原型：地图�
 bash scripts/build-图块原型.sh  # 图块原型：出 ./tilemap（项目根运行；编译前先跑地图/门校验，不过不编译）
 touch /tmp/tilemap-自检 && ./tilemap   # 自动验收：走 01→02→03→02，用引擎自己的 R.截图 出 /tmp/走廊自检-N-*.png
 date > /tmp/走廊截图.请求              # 按需截图：内容一变就截当前帧到 /tmp/走廊截图.png（不抢焦点、不碰键盘）
+touch /tmp/tilemap-存档自检 && ./tilemap   # 存档自检：写槽1→读回→载入→写槽6→删→截 /tmp/存档屏.png，自动关窗
 ```
 
 - 渲染程序 `xtc tie` 链接阶段**必失败**（渲染包 raylib 是 Windows 构建，预期）：
