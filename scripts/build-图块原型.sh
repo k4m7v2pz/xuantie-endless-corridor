@@ -10,8 +10,12 @@ RL="$HOME/Library/Caches/xtl/raylib/darwin-arm64/libraylib.a"
 BR="$HOME/Library/Caches/xtl/core/darwin-arm64/xtc-package/lib/渲染"
 
 bash scripts/xtc-抓IR.sh "$XTC" "$PROJ" /tmp/tilemap.ll "原型/图块地图.xt" tilemap
-clang -target arm64-apple-darwin -c /tmp/tilemap.ll -o /tmp/tilemap.o -Og
+# 噪音静音：.ll 自带通用 target（会被覆盖成宿主 triple，无害）；
+# xt_tls.c 里的 kTLSProtocol12 是运行时自身的老 API 用法，不影响我们。
+# 只静这两类已知无害告警，真正出错仍然会打出来。
+QUIET="-Wno-override-module -Wno-deprecated-declarations"
+clang -target arm64-apple-darwin -c /tmp/tilemap.ll -o /tmp/tilemap.o -Og $QUIET
 clang -target arm64-apple-darwin -c "$BR/渲染桥.c" -o /tmp/tilemap_bridge.o -I "$BR" -Og
-clang /tmp/tilemap.o "$RT/xt_runtime.c" "$RT/xt_threadpool.c" "$RT/xt_net.c" "$RT/xt_tls.c" "$RT/xt_process.c" /tmp/tilemap_bridge.o "$RL" \
+clang $QUIET /tmp/tilemap.o "$RT/xt_runtime.c" "$RT/xt_threadpool.c" "$RT/xt_net.c" "$RT/xt_tls.c" "$RT/xt_process.c" /tmp/tilemap_bridge.o "$RL" \
   -o tilemap -framework Cocoa -framework OpenGL -framework IOKit -framework CoreVideo
 echo "✅ 构建完成: $PROJ/tilemap"
