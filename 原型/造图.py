@@ -165,6 +165,39 @@ def 行检查(行, 高, 错):
             错.append(f"第 {纵} 行不是整行墙")
 
 
+def 查门(文件们):
+    """双向门校验：A 的门落到 B 的哪一格，那一格在 B 里必须也是一扇门，且回到 A 的门。
+    "门对门"是唯一自洽的落地语义（人从门里出来，站在那扇门上），也免了手填坐标。"""
+    名册 = {}
+    for 路径 in 文件们:
+        名册[str(Path(路径).resolve())] = 读(路径)
+    错 = []
+    if len(名册) < 2:
+        return 错
+    for 路, 图 in 名册.items():
+        名 = Path(路).name
+        for 条 in 图.get("传送", []):
+            到路 = (根.parent / 条["到图"]).resolve()
+            if str(到路) not in 名册:
+                错.append(f"{名} 的传送点 ({条['x']},{条['y']}) 指向未一起校验的图 {条['到图']}")
+                continue
+            到图 = 名册[str(到路)]
+            落 = (int(条["到x"]), int(条["到y"]))
+            同格门 = [t for t in 到图.get("传送", []) if (t["x"], t["y"]) == 落]
+            if not 同格门:
+                错.append(
+                    f"{名} ({条['x']},{条['y']}) → {Path(到路).name} 落点 {落} 不是那边的门"
+                    f"（门对门要求落点就是对方的门格）"
+                )
+                continue
+            回门 = 同格门[0]
+            if not str((根.parent / 回门["到图"]).resolve()) == 路:
+                错.append(f"{Path(到路).name} 的落点门 {落} 不回指 {名}")
+            elif (int(回门["到x"]), int(回门["到y"])) != (int(条["x"]), int(条["y"])):
+                错.append(f"{名} 与 {Path(到路).name} 的门 {落} 落点不对偶")
+    return 错
+
+
 def main(参):
     if not 参:
         raise SystemExit("用法：造图.py <房稿.json> | --校验 <地图.json>...")
@@ -174,6 +207,10 @@ def main(参):
             图 = 读(路径)
             地格, 物件数, 门数 = 查(图, Path(路径).name)
             print(f"✅ {Path(路径).name}: 可走 {地格} 格 / 物件 {物件数} / 门 {门数}")
+        门错 = 查门(参[1:])
+        if 门错:
+            raise SystemExit("【门】校验失败：\n  - " + "\n  - ".join(门错))
+        print("✅ 门：全部对偶（落点即对方门格）")
         return
 
     稿路径 = 参[0]
