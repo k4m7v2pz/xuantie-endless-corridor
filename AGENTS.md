@@ -35,6 +35,8 @@ bash scripts/关闭.sh            # 关掉本项目所有残留窗口
 bash run-story.sh               # TUI 剧情播放器（参数 2 跑《恐哀》）；
                                 # 故事目录内也有 运行.sh，缺产物会自动重编译
 bash tests/浮点内存阈值.sh      # 浮点内存回归判据（详见「已知坑」8）
+python3 原型/造图.py --校验 原型/地图*.json   # 图块原型：地图结构/连通性校验
+bash scripts/build-图块原型.sh  # 图块原型：出 ./tilemap（项目根运行）
 ```
 
 - 渲染程序 `xtc tie` 链接阶段**必失败**（渲染包 raylib 是 Windows 构建，预期）：
